@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+frames
+clips
+audio_frames
+
+sam2_detections.json
+sam2_detections_first_processed.png
+sam2_detections_first_processed.jpg
+
+depth_maps
+# Virtual environments
+.venv
+
+object_detection/sam2_checkpoints/
+object_detection/sam2_config/
+gsplat_output/
+structure_from_motion/colmap_output/*
+depth_estimation/depth_anything_ckpt/*
+gs_dataset
