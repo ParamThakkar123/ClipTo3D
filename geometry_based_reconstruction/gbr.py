@@ -437,7 +437,6 @@ if __name__ == "__main__":
         "--colmap-txt", "--colmap_txt",
         dest="colmap_txt",
         type=Path,
-        # changed default to use the numeric model folder 0 as requested
         default=Path("structure_from_motion/colmap_output/sparse/0"),
         help="COLMAP model_txt dir (cameras.txt, images.txt)",
     )

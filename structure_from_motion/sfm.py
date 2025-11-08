@@ -62,30 +62,27 @@ def run_colmap_fast(frames_dir: Path, out_dir: Path, colmap_bin: Optional[str] =
     sparse = out_dir / "sparse"
     txt = sparse / "model_txt"
 
-    # 1️⃣ FAST FEATURE EXTRACTION (multi-threaded + GPU)
     feat_cmd = [
         cb, "feature_extractor",
         "--database_path", str(db),
         "--image_path", str(frames_dir),
         "--ImageReader.single_camera", "1",
         "--SiftExtraction.use_gpu", "1" if use_gpu else "0",
-        "--SiftExtraction.max_num_features", "4096",     # lower = faster
+        "--SiftExtraction.max_num_features", "4096",    
         "--SiftExtraction.num_threads", str(os.cpu_count() or 8),
     ]
     _run_cmd(feat_cmd)
 
-    # 2️⃣ FAST MATCHING (GPU + low overlap)
     match_cmd = [
         cb, "sequential_matcher",
         "--database_path", str(db),
         "--SiftMatching.use_gpu", "1" if use_gpu else "0",
         "--SiftMatching.num_threads", str(os.cpu_count() or 8),
         "--SiftMatching.max_ratio", "0.7",
-        "--SequentialMatching.overlap", "2",            # lower overlap = faster
+        "--SequentialMatching.overlap", "2",           
     ]
     _run_cmd(match_cmd)
 
-    # 3️⃣ FAST MAPPER (skip BA refinement on all params)
     sparse.mkdir(parents=True, exist_ok=True)
     map_cmd = [
         cb, "mapper",
@@ -98,39 +95,32 @@ def run_colmap_fast(frames_dir: Path, out_dir: Path, colmap_bin: Optional[str] =
         "--Mapper.tri_min_angle", "2",
         "--Mapper.abs_pose_min_num_inliers", "10",
         "--Mapper.filter_max_reproj_error", "8",
-        "--Mapper.ba_global_max_refinements", "1",       # limit BA passes
+        "--Mapper.ba_global_max_refinements", "1",     
         "--Mapper.ba_local_max_refinements", "1",
-        "--Mapper.extract_colors", "0",                  # skip color (saves time)
+        "--Mapper.extract_colors", "0",                  
         "--Mapper.num_threads", str(os.cpu_count() or 8),
     ]
     _run_cmd(map_cmd)
 
-    # 4️⃣ CONVERT MODEL TO TXT
     txt.mkdir(parents=True, exist_ok=True)
 
-    # --- new: verify mapper output and convert per-model folder ---
-    # look for numbered model folders (e.g. sparse/0, sparse/1, ...)
     model_dirs = []
     if sparse.exists():
         for p in sorted(sparse.iterdir()):
             if p.is_dir():
-                # look for COLMAP binary model files inside
                 if (p / "cameras.bin").exists() and (p / "images.bin").exists() and (p / "points3D.bin").exists():
                     model_dirs.append(p)
-        # also allow direct binaries placed in sparse (rare)
         if not model_dirs and (sparse / "cameras.bin").exists():
             model_dirs = [sparse]
 
     if not model_dirs:
-        # helpful diagnostic: list sparse contents and abort conversion
         contents = sorted([str(p) for p in sparse.iterdir()]) if sparse.exists() else []
         raise RuntimeError(
             f"No COLMAP binary model found in '{sparse}'. "
             f"Expected subfolder(s) with cameras.bin, images.bin, points3D.bin. "
             f"Directory contents: {contents}"
         )
-
-    # convert every detected model directory
+    
     for i, model_dir in enumerate(model_dirs):
         out_txt = txt / (model_dir.name if model_dir is not sparse else f"model_{i}")
         out_txt.mkdir(parents=True, exist_ok=True)
@@ -141,7 +131,6 @@ def run_colmap_fast(frames_dir: Path, out_dir: Path, colmap_bin: Optional[str] =
             "--output_type", "TXT"
         ]
         _run_cmd(convert_cmd)
-    # --- end new code ---
 
     logging.info("✅ Fast COLMAP reconstruction done.")
     return txt

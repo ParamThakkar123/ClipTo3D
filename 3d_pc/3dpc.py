@@ -4,15 +4,13 @@ import numpy as np
 import imageio
 from tqdm import tqdm
 
-# === CONFIG ===
 TRANS = "gsplat_output/transforms.json"
 OUT_PLY = "fused_cloud.ply"
-IMG_ROOT = "gsplat_output"   # transforms "file_path" is relative to this
-DEPTH_DIR = "depth_maps"     # folder containing depth .npy files
-MAX_PER_FRAME = 50000        # limit points per frame to control memory
-GLOBAL_MAX_DEPTH = 5.0       # approximate max scene depth (meters)
+IMG_ROOT = "gsplat_output"   
+DEPTH_DIR = "depth_maps"   
+MAX_PER_FRAME = 50000        
+GLOBAL_MAX_DEPTH = 5.0      
 
-# === UTILITIES ===
 def load_transforms(path):
     with open(path, 'r') as f:
         return json.load(f)
@@ -34,7 +32,6 @@ def write_ply(filename, pts, cols):
             f.write(p.tobytes())
             f.write(c.tobytes())
 
-# === MAIN RECONSTRUCTION ===
 def main():
     j = load_transforms(TRANS)
     fx, fy, cx, cy = j.get("fl_x"), j.get("fl_y"), j.get("cx"), j.get("cy")
@@ -47,9 +44,8 @@ def main():
         if not matrix_ok(f.get("transform_matrix", None)):
             continue
 
-        T = np.array(f["transform_matrix"], dtype=np.float32)  # camera->world
+        T = np.array(f["transform_matrix"], dtype=np.float32)
 
-        # Derive depth map path
         base = os.path.splitext(os.path.basename(f["file_path"]))[0]
         depth_path = os.path.join(DEPTH_DIR, base + "_depth.npy")
         if not os.path.exists(depth_path):
@@ -63,7 +59,6 @@ def main():
 
         img = imageio.imread(fp)[..., :3].astype(np.float32) / 255.0
 
-        # Build pixel grid
         us, vs = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
         Z = depth
         valid = (Z > 0) & np.isfinite(Z)
@@ -71,7 +66,6 @@ def main():
         if valid_idx.size == 0:
             continue
 
-        # Subsample for performance
         if valid_idx.size > MAX_PER_FRAME:
             sel = np.random.choice(valid_idx, MAX_PER_FRAME, replace=False)
         else:
@@ -81,26 +75,19 @@ def main():
         vs_r = vs.ravel()[sel]
         z_r = Z.ravel()[sel].astype(np.float32)
 
-        # === Depth normalization / scaling ===
-        # Normalize depth per-frame to [0, GLOBAL_MAX_DEPTH]
         if np.max(z_r) > 0:
             z_r = (z_r / np.max(z_r)) * GLOBAL_MAX_DEPTH
         else:
             continue
-        # =====================================
 
-        # Backproject to camera coordinates
         x_r = (us_r - cx) * z_r / fx
         y_r = (vs_r - cy) * z_r / fy
         pts_cam = np.stack([x_r, y_r, z_r, np.ones(len(sel), dtype=np.float32)], axis=0)
 
-        # Transform to world coordinates
         pts_world = (T @ pts_cam).T[:, :3]
 
-        # Get colors
         cols = img.reshape(-1, 3)[sel]
 
-        # Filter invalid or huge values
         mask = np.isfinite(pts_world).all(axis=1) & (np.abs(pts_world) < 100).all(axis=1)
         pts_world = pts_world[mask]
         cols = cols[mask]
@@ -115,7 +102,6 @@ def main():
         print("❌ No valid points reconstructed.")
         return
 
-    # Merge all frames
     P = np.vstack(pts_all).astype(np.float32)
     C = np.vstack(cols_all).astype(np.float32)
 

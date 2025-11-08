@@ -6,7 +6,6 @@ import logging
 import sys
 from typing import Optional
 
-# ensure workspace root is on sys.path so package-style imports work when running the script directly
 try:
     from structure_from_motion.sfm import list_frames
 except Exception:
@@ -50,7 +49,7 @@ def run_gsplat_train_py(cfg_path: Path) -> bool:
     Import installed gsplat module and call its Python API. Return True on success.
     """
     try:
-        import gsplat  # imported here so script doesn't require gsplat at module import time
+        import gsplat  
     except Exception as e:
         logging.debug("gsplat module import failed: %s", e)
         return False
@@ -91,12 +90,10 @@ def train_from_colmap(
     out_dir = out_dir.resolve()
     cfg_path = create_default_config(out_dir, images_dir, colmap_model_txt, depth_maps_dir)
 
-    # Prefer Python API (requires gsplat installed in this interpreter)
     if run_gsplat_train_py(cfg_path):
         logging.info(f"gsplat training finished. Results in {out_dir}")
         return
 
-    # Fallback to CLI if available
     gsplat_bin = find_gsplat_bin()
     if gsplat_bin:
         run_gsplat_train_cli(gsplat_bin, cfg_path)
@@ -115,7 +112,7 @@ if __name__ == "__main__":
     parser.add_argument("--depth-maps", type=Path, default=Path("depth_maps"), help="optional precomputed depth maps")
     args = parser.parse_args()
 
-    imgs = list_frames(args.images)  # from structure_from_motion.sfm
+    imgs = list_frames(args.images) 
     logging.info("Found %d images under %s", len(imgs), args.images)
 
     train_from_colmap(args.images, args.colmap_out, args.out, args.depth_maps if args.depth_maps.exists() else None)

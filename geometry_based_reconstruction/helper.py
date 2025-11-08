@@ -1,7 +1,6 @@
 from pathlib import Path
 import sys
 
-# try to import helpers from workspace
 try:
     from geometry_based_reconstruction.gbr import list_model_image_names
     from structure_from_motion.sfm import list_frames

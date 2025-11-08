@@ -5,18 +5,13 @@ import torch
 import cv2
 import sys
 
-# Try relative import first (works when package is imported), then try absolute import,
-# then add local folder to sys.path as a last resort.
 DepthAnythingV2 = None
 try:
-    # Preferred: relative import when running as a package
-    from .depth_anything_v2.dpt import DepthAnythingV2  # type: ignore
+    from .depth_anything_v2.dpt import DepthAnythingV2
 except Exception:
     try:
-        # Fallback: absolute import (works when running from project root and package installed)
-        from depth_anything_v2.dpt import DepthAnythingV2  # type: ignore
+        from depth_anything_v2.dpt import DepthAnythingV2
     except Exception:
-        # Last resort: if there's a local repo folder depth_anything_v2 under depth_estimation/
         local_pkg = Path(__file__).resolve().parents[0] / "depth_anything_v2"
         if local_pkg.exists():
             sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
@@ -114,9 +109,9 @@ def estimate_depths_midas(
 def estimate_depths(
         frames_dir: str = "./frames",
         out_dir: str = "./depth_maps",
-        model_backend: str = "midas",              # "midas" or "depthanythingv2"
-        model_type: str = "DPT_Large",             # used for midas
-        depthanything_ckpt: str | None = None,     # path to depthanythingv2 checkpoint
+        model_backend: str = "midas",              
+        model_type: str = "DPT_Large",           
+        depthanything_ckpt: str | None = None,     
         use_cuda: bool = True,
 ):
     """
@@ -161,22 +156,18 @@ def estimate_depths(
             if not img_file.is_file() or img_file.suffix.lower() not in exts:
                 continue
 
-            # read with cv2 (BGR) per the usage snippet
             raw_bgr = cv2.imread(str(img_file))
             if raw_bgr is None:
                 print(f"Warning: failed to read {img_file}, skipping.")
                 continue
 
-            # DepthAnythingV2 example uses model.infer_image(raw_img)
             with torch.no_grad():
                 depth = model.infer_image(raw_bgr)
 
-            # ensure numpy and 2D
             depth = np.array(depth).squeeze()
             if depth.ndim == 3 and depth.shape[2] == 1:
                 depth = depth[:, :, 0]
 
-            # optionally resize to original image size (cv2 read)
             orig_h, orig_w = raw_bgr.shape[:2]
             if (depth.shape[0], depth.shape[1]) != (orig_h, orig_w):
                 depth = cv2.resize(depth.astype(np.float32), (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
@@ -201,10 +192,8 @@ def estimate_depths(
 
 
 if __name__ == "__main__":
-    # Example: run MiDaS (keeps previous behavior)
     # estimate_depths_midas(frames_dir="./frames", out_dir="./depth_maps", model_type="DPT_Large", use_cuda=True)
 
-    # Example: run DepthAnythingV2 backend (provide checkpoint path)
     estimate_depths(frames_dir="./frames", out_dir="./depth_maps",
                     model_backend="depthanythingv2",
                     depthanything_ckpt="./depth_estimation/depth_anything_ckpt/checkpoints/depth_anything_v2_vitl.pth",

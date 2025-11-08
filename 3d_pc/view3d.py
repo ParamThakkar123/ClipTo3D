@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import trimesh
 
 PLY = "fused_cloud.ply"
-MAX_POINTS = 50000  # downsample for plotting
+MAX_POINTS = 50000 
 
 def load_ply(path):
     ply = PlyData.read(path)
@@ -37,7 +37,6 @@ def main():
     plt.show()
     mesh = trimesh.load("fused_cloud.ply", process=False)
     print("vertices:", len(mesh.vertices))
-    # trimesh shows pointcloud in an interactive window (requires pyglet)
     mesh.show()
 
 if __name__ == "__main__":

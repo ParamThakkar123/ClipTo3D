@@ -3,7 +3,6 @@ import numpy as np
 from PIL import Image
 from typing import Optional, Tuple
 
-# new imports for visualization
 import matplotlib.pyplot as plt
 
 def depth_to_point_cloud(depth: np.ndarray,
@@ -98,8 +97,6 @@ def find_corresponding_color(depth_file: Path, frames_dir: Path) -> Optional[np.
                 continue
     return None
 
-# New visualization helpers
-
 def _normalize_colors(colors: np.ndarray) -> np.ndarray:
     """Return Nx3 uint8 colors from a color array (handles 0..1 floats or 0..255 ints)."""
     if colors.dtype == np.float32 or colors.dtype == np.float64:
@@ -146,12 +143,10 @@ def visualize_point_cloud(points: np.ndarray,
 
     if cols is not None:
         cols = _normalize_colors(cols)
-        # scatter expects colors scaled 0..1
         ax.scatter(x, y, z, c=cols / 255.0, s=0.5, linewidths=0)
     else:
         ax.scatter(x, y, z, c="k", s=0.5, linewidths=0)
 
-    # attempt to set equal aspect by setting limits with same range
     xlim = (x.min(), x.max())
     ylim = (y.min(), y.max())
     zlim = (z.min(), z.max())
@@ -248,7 +243,6 @@ if __name__ == "__main__":
     # convert_all_depths(depth_dir="./depth_maps", out_dir="./point_clouds", frames_dir="./frames",
     #                    focal_factor=0.5, depth_scale=1.0, include_color=True)
 
-    # Example: visualize a single depth file (uncomment to use)
     from pathlib import Path
     visualize_depth_file(Path("./depth_maps/frame_000001_depth.npy"), frames_dir="./frames",
                          focal_factor=0.5, depth_scale=1.0, include_color=True)
