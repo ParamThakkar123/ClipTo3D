@@ -2,7 +2,6 @@ import os
 import shutil
 import subprocess
 from typing import Optional
-from medal_clip import download_medal_clip
 import argparse
 
 def _ensure_ffmpeg_available() -> None:
@@ -51,8 +50,8 @@ def extract_audio(
     return out_path
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Extract audio from video for ambient analysis.")
-    p.add_argument("input", help="Path to input video file or Medal clip URL.")
+    p = argparse.ArgumentParser(description="Extract audio from a local/uploaded video file for ambient analysis.")
+    p.add_argument("input", help="Path to input video file (local/uploaded file).")
     p.add_argument("--out_dir", default="audio", help="Output directory.")
     p.add_argument("--sr", type=int, default=16000, help="Sample rate (Hz).")
     p.add_argument("--ch", type=int, default=1, help="Number of channels (1=mono).")
@@ -63,10 +62,11 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     input_arg = args.input
+    # Expect a local/uploaded video path. If the file does not exist, error out.
     video_path = input_arg
-    if input_arg.startswith("http://") or input_arg.startswith("https://"):
-        print("Downloading video from URL...")
-        video_path = download_medal_clip(input_arg, out_dir="temp_video")
+    if not os.path.exists(video_path):
+        print(f"Error: input video not found: {video_path}")
+        raise SystemExit(1)
 
     try:
         out = extract_audio(

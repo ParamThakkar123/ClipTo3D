@@ -3,7 +3,6 @@ import shutil
 import glob
 import subprocess
 from typing import List, Optional
-from medal_clip import download_medal_clip
 import argparse
 
 def _ensure_ffmpeg_available() -> None:
@@ -68,7 +67,7 @@ def extract_frames(
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Extract frames from a video file using ffmpeg.")
-    p.add_argument("input", help="Path to the input video file.")
+    p.add_argument("input", help="Path to the input video file (local/uploaded file).")
     p.add_argument("--out_dir", default="frames", help="Output directory for extracted frames.")
     group = p.add_mutually_exclusive_group()
     group.add_argument("--fps", type=float, help="Frames per second to extract.")
@@ -79,12 +78,10 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     input_arg = args.input
-    # Use the provided input path by default; if it's a URL, we'll overwrite this with the downloaded path.
     video_path = input_arg
-
-    if input_arg.startswith("http://") or input_arg.startswith("https://"):
-        print("Downloading video from URL...")
-        video_path = download_medal_clip(input_arg, out_dir="temp_video")
+    if not os.path.exists(video_path):
+        print(f"Error: input video not found: {video_path}")
+        raise SystemExit(1)
 
     try:
         extract_frames(

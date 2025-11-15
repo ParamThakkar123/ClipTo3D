@@ -6,7 +6,6 @@ import argparse
 from PIL import Image
 import sys
 import subprocess
-from typing import cast
 
 try:
     from structure_from_motion.sfm import list_frames, resolve_colmap_bin
