@@ -1,0 +1,44 @@
+# Keep the build context small — `COPY . /app` is the last layer, so anything
+# large here is copied into every image and busts the cache on every change.
+.git
+.gitignore
+.venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+
+# Job outputs and reconstruction artifacts.
+runs/
+frames/
+depth/
+gs_dataset/
+gsplat_output/
+structure_from_motion/colmap_output*/
+*.ply
+*.splat
+*.npy
+*.db
+
+# Media and model weights: mount these, do not bake them into the context.
+*.mp4
+*.mov
+*.mkv
+*.pth
+*.ckpt
+*.safetensors
+
+# Docker's own files are not needed inside the image — with one exception, the
+# API's launcher, which the image runs. See the script for why the proxy-header
+# flags cannot be baked into a CMD.
+docker/
+!docker/api-entrypoint.sh
+Dockerfile*
+docker-compose.yml
+
+# Secrets. `.env` holds the bootstrap key and any bucket credentials; it must
+# never be copied into a layer, where it would outlive the container that
+# needed it and ship with the image.
+.env
+.env.*
+!.env.example

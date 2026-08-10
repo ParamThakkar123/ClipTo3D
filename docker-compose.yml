@@ -1,0 +1,125 @@
+# Single-host deployment: a small API container, one or more GPU worker
+# containers, and optionally a TLS terminator in front.
+#
+#   cp .env.example .env && edit it        # at minimum, set the bootstrap key
+#   docker compose up -d api worker        # HTTP on :8000
+#   docker compose --profile tls up -d     # HTTPS via Caddy, needs a real domain
+#
+# The split matters. Reconstruction wants a GPU, COLMAP and several gigabytes
+# of image; the API wants to stay up. They share `/data` and coordinate through
+# the lease queue in job_registry.py — a worker claims a row, heartbeats while
+# it works, and a worker that dies has its job requeued rather than stranded.
+#
+# Still single-host: SQLite coordinates processes on one machine, not across
+# machines. Scaling past one box means a broker behind the same
+# claim/heartbeat/complete interface.
+
+name: clipto3d
+
+x-common: &common
+  restart: unless-stopped
+  environment: &common-env
+    CLIPTO3D_JOBS_ROOT: /data
+    CLIPTO3D_STORAGE: ${CLIPTO3D_STORAGE:-}
+    CLIPTO3D_LEASE_SECONDS: ${CLIPTO3D_LEASE_SECONDS:-3600}
+    CLIPTO3D_LOG_LEVEL: ${CLIPTO3D_LOG_LEVEL:-INFO}
+    # Object storage credentials, when CLIPTO3D_STORAGE points at a bucket.
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
+
+services:
+  api:
+    <<: *common
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+    image: clipto3d-api:latest
+    environment:
+      <<: *common-env
+      # No in-process workers: the worker container below does that work.
+      CLIPTO3D_WORKERS: 0
+      # `public` turns this into a self-serve site: visitors mint their own
+      # keys and get their own namespace and quota. See .env.example.
+      CLIPTO3D_AUTH: ${CLIPTO3D_AUTH:-strict}
+      CLIPTO3D_KEYS_PER_ADDRESS: ${CLIPTO3D_KEYS_PER_ADDRESS:-5}
+      CLIPTO3D_SHARE_TTL_SECONDS: ${CLIPTO3D_SHARE_TTL_SECONDS:-0}
+      # Required in strict mode to mint the first API key. Without it the
+      # process generates one and logs it at startup — fine for a first look,
+      # useless across restarts.
+      CLIPTO3D_BOOTSTRAP_KEY: ${CLIPTO3D_BOOTSTRAP_KEY:?set CLIPTO3D_BOOTSTRAP_KEY in .env}
+      CLIPTO3D_MAX_UPLOAD_MB: ${CLIPTO3D_MAX_UPLOAD_MB:-500}
+      CLIPTO3D_QUOTA_ACTIVE: ${CLIPTO3D_QUOTA_ACTIVE:-2}
+      CLIPTO3D_QUOTA_TOTAL: ${CLIPTO3D_QUOTA_TOTAL:-50}
+      CLIPTO3D_RATE_LIMIT: ${CLIPTO3D_RATE_LIMIT:-120}
+      CLIPTO3D_JOB_RETENTION_DAYS: ${CLIPTO3D_JOB_RETENTION_DAYS:-30}
+      CLIPTO3D_UPLOAD_RETENTION_HOURS: ${CLIPTO3D_UPLOAD_RETENTION_HOURS:-24}
+      CLIPTO3D_CORS_ORIGINS: ${CLIPTO3D_CORS_ORIGINS:-}
+      # Believe X-Forwarded-For only because Caddy sets it. Turning this on
+      # without a proxy in front lets a client forge its own rate-limit bucket;
+      # leaving it off *with* the tls profile costs you HSTS, because the API
+      # then has no way to learn the request arrived over TLS. Set it to 1 in
+      # .env when you run `--profile tls`.
+      CLIPTO3D_TRUST_PROXY: ${CLIPTO3D_TRUST_PROXY:-0}
+      CLIPTO3D_FORWARDED_ALLOW_IPS: ${CLIPTO3D_FORWARDED_ALLOW_IPS:-*}
+    volumes:
+      - jobs:/data
+    # Published on loopback only; Caddy is what faces the internet. Change to
+    # "8000:8000" to expose it directly, which is fine behind another proxy
+    # and not fine on its own.
+    ports:
+      - "${CLIPTO3D_BIND:-127.0.0.1}:8000:8000"
+
+  worker:
+    <<: *common
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        # Narrow this to your own GPUs to cut a long COLMAP build materially.
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-7.5;8.0;8.6;8.9;9.0}
+        BAKE_CHECKPOINTS: ${BAKE_CHECKPOINTS:-depth-anything-v2-vitl}
+    image: clipto3d-worker:latest
+    # The image's own entrypoint is the one-shot pipeline CLI; here we want the
+    # long-running queue consumer instead.
+    entrypoint: ["python", "worker.py"]
+    command: ["--jobs-root", "/data"]
+    environment:
+      <<: *common-env
+      CLIPTO3D_WORKERS: ${CLIPTO3D_WORKERS:-1}
+    volumes:
+      - jobs:/data
+    # Reconstruction is the memory-hungry half; capping it means an oversized
+    # clip kills the worker rather than the host. The job is requeued.
+    shm_size: 1gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Automatic HTTPS. `getUserMedia` in the capture page needs a secure context,
+  # so a real certificate is a functional requirement here, not just hygiene.
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      CLIPTO3D_DOMAIN: ${CLIPTO3D_DOMAIN:?set CLIPTO3D_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  jobs:
+  caddy_data:
+  caddy_config:

@@ -1,118 +1,76 @@
-import subprocess
-import shutil
-import json
-from pathlib import Path
+"""Gaussian splat training entry point.
+
+This module used to probe for a `gsplat.train()` function and a `gsplat` console
+script, neither of which exists, so it could only ever raise `EnvironmentError`
+(MPO-223). It now delegates to the real trainer in `neural_reconstruction.trainer`.
+"""
+
+from __future__ import annotations
+
+import argparse
 import logging
 import sys
+from pathlib import Path
 from typing import Optional
 
-try:
-    from structure_from_motion.sfm import list_frames
-except Exception:
-    _workspace_root = Path(__file__).resolve().parents[1]
-    if str(_workspace_root) not in sys.path:
-        sys.path.insert(0, str(_workspace_root))
-    from structure_from_motion.sfm import list_frames
+_repo_root = Path(__file__).resolve().parents[1]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
-logging.basicConfig(level=logging.INFO)
+from neural_reconstruction.trainer import (  # noqa: E402
+    TrainConfig,
+    TrainResult,
+    train_from_colmap,
+)
 
-
-def find_gsplat_bin(name: str = "gsplat") -> Optional[str]:
-    p = shutil.which(name)
-    if p:
-        logging.info(f"Found gsplat binary at {p}")
-        return p
-    logging.debug("gsplat binary not found in PATH.")
-    return None
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def create_default_config(out_dir: Path, images_dir: Path, colmap_model_txt: Path, depth_dir: Optional[Path] = None):
-    cfg = {
-        "images": str(images_dir),
-        "colmap_model": str(colmap_model_txt),
-        "output_dir": str(out_dir),
-        "num_steps": 20000,
-        "lr_init": 0.01,
-        "batch_size": 4096,
-        "depth_maps": str(depth_dir) if depth_dir else None,
-    }
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = out_dir / "gsplat_config.json"
-    with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=4)
-    logging.info(f"Created default gsplat config at {cfg_path}")
-    return cfg_path
-
-
-def run_gsplat_train_py(cfg_path: Path) -> bool:
-    """
-    Import installed gsplat module and call its Python API. Return True on success.
-    """
-    try:
-        import gsplat  
-    except Exception as e:
-        logging.debug("gsplat module import failed: %s", e)
-        return False
-
-    try:
-        with cfg_path.open() as f:
-            cfg = json.load(f)
-        if hasattr(gsplat, "train"):
-            logging.info("Launching gsplat.train(...) via Python API")
-            gsplat.train(cfg)  # type: ignore
-            return True
-        logging.warning("gsplat module found but no train() entrypoint detected.")
-        return False
-    except Exception as e:
-        logging.error("Error running gsplat Python API: %s", e)
-        return False
-
-
-def run_gsplat_train_cli(gsplat_bin: str, cfg_path: Path) -> None:
-    cmd = [gsplat_bin, "train", "--config", str(cfg_path)]
-    logging.info("Running gsplat CLI: %s", " ".join(map(str, cmd)))
-    subprocess.run(cmd, check=True)
-
-
-def train_from_colmap(
-        images_dir: Path,
-        colmap_model_txt: Path,
-        out_dir: Path,
-        depth_maps_dir: Optional[Path] = None,
-):
-    images_dir = images_dir.resolve()
-    colmap_model_txt = colmap_model_txt.resolve()
-    if not images_dir.exists() or not images_dir.is_dir():
-        raise FileNotFoundError(f"Images directory {images_dir} does not exist.")
-    if not colmap_model_txt.exists() or not colmap_model_txt.is_dir():
-        raise FileNotFoundError(f"COLMAP model directory {colmap_model_txt} does not exist.")
-
-    out_dir = out_dir.resolve()
-    cfg_path = create_default_config(out_dir, images_dir, colmap_model_txt, depth_maps_dir)
-
-    if run_gsplat_train_py(cfg_path):
-        logging.info(f"gsplat training finished. Results in {out_dir}")
-        return
-
-    gsplat_bin = find_gsplat_bin()
-    if gsplat_bin:
-        run_gsplat_train_cli(gsplat_bin, cfg_path)
-        return
-
-    raise EnvironmentError("gsplat not available (no Python module and no gsplat CLI). Install gsplat in this environment or add gsplat CLI to PATH.")
+def train(
+    images_dir: Path | str,
+    colmap_dir: Path | str,
+    out_dir: Path | str,
+    max_steps: int = 7_000,
+    max_image_side: int = 1_600,
+    sh_degree: int = 3,
+    device: Optional[str] = None,
+) -> TrainResult:
+    """Train a splat model. Kept as a thin, stable wrapper over the trainer."""
+    cfg = TrainConfig(
+        max_steps=max_steps, max_image_side=max_image_side, sh_degree=sh_degree
+    )
+    return train_from_colmap(colmap_dir, images_dir, out_dir, config=cfg, device=device)
 
 
 if __name__ == "__main__":
-    import argparse
+    p = argparse.ArgumentParser(
+        description="Train a gaussian splatting model from frames + a COLMAP model."
+    )
+    # No hardcoded absolute paths (MPO-229) — these are repo-relative defaults.
+    p.add_argument("--images", type=Path, default=Path("frames"))
+    p.add_argument(
+        "--colmap-out", "--colmap_out", dest="colmap_out", type=Path,
+        default=Path("colmap"),
+        help="COLMAP model dir, or any ancestor of it.",
+    )
+    p.add_argument("--out", type=Path, default=Path("splat"))
+    p.add_argument("--max-steps", type=int, default=7_000)
+    p.add_argument("--max-image-side", type=int, default=1_600,
+                   help="Downscale training images so they fit in VRAM.")
+    p.add_argument("--sh-degree", type=int, default=3, choices=[0, 1, 2, 3])
+    p.add_argument("--device", default=None, help="Defaults to cuda when available.")
+    args = p.parse_args()
 
-    parser = argparse.ArgumentParser(description="Train gaussian splatting model from frames + COLMAP output")
-    parser.add_argument("--images", type=Path, default=Path("frames"), help="frames directory (images)")
-    parser.add_argument("--colmap-out", type=Path, default=Path(r"E:\ClipToWorld\structure_from_motion\colmap_output"), help="COLMAP output directory (contains sparse/model_txt)")
-    parser.add_argument("--out", type=Path, default=Path("gsplat_output"), help="training output dir")
-    parser.add_argument("--depth-maps", type=Path, default=Path("depth_maps"), help="optional precomputed depth maps")
-    args = parser.parse_args()
-
-    imgs = list_frames(args.images) 
-    logging.info("Found %d images under %s", len(imgs), args.images)
-
-    train_from_colmap(args.images, args.colmap_out, args.out, args.depth_maps if args.depth_maps.exists() else None)
+    result = train(
+        images_dir=args.images,
+        colmap_dir=args.colmap_out,
+        out_dir=args.out,
+        max_steps=args.max_steps,
+        max_image_side=args.max_image_side,
+        sh_degree=args.sh_degree,
+        device=args.device,
+    )
+    logging.info(
+        "Training finished: %d steps, final loss %.5f, %d gaussians -> %s",
+        result.steps, result.final_loss, result.n_gaussians, result.ply_path,
+    )

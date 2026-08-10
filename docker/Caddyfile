@@ -1,0 +1,32 @@
+# TLS terminator for the job service.
+#
+# Caddy gets and renews a certificate on its own, which is the shortest path to
+# the secure context `viewer/capture.html` needs: getUserMedia does not run on
+# plain HTTP anywhere except localhost, so without this the capture client is
+# unusable on a phone.
+
+{$CLIPTO3D_DOMAIN} {
+	encode zstd gzip
+
+	# Video uploads. This has to be at least CLIPTO3D_MAX_UPLOAD_MB or the
+	# proxy rejects the clip before the API ever sees it — and it does so with
+	# a 413 that the API's own limit message never gets to explain.
+	request_body {
+		max_size 512MB
+	}
+
+	reverse_proxy api:8000 {
+		# Reconstruction status is polled, not streamed; the long timeout is
+		# for the upload leg, where a slow mobile connection sending 500 MB
+		# legitimately holds a request open for a long time.
+		transport http {
+			read_timeout 30m
+			write_timeout 30m
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

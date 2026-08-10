@@ -1,18 +1,184 @@
 [project]
 name = "cliptoworld"
 version = "0.1.0"
-description = "Add your description here"
+description = "Reconstruct 3D scenes from video clips (frames -> depth -> SfM -> gaussian splats / fused point cloud)"
 readme = "README.md"
-requires-python = ">=3.13"
+# 3.13 made `sam2` and parts of the CV stack unresolvable. 3.11 is the floor
+# that keeps every dependency below installable.
+requires-python = ">=3.11"
+# Torch is deliberately NOT here — see the cpu/cuda/mps extras below. The base
+# install is the torch-free half of the pipeline: frame and audio extraction,
+# COLMAP parsing, dataset conversion, fusion, PLY export and viewing.
 dependencies = [
-    "dotenv>=0.9.9",
-    "gsplat>=1.5.3",
+    # Core numerics / imaging. Previously pulled in only transitively via
+    # gsplat and imageio, which meant they vanished from the graph whenever
+    # those extras were skipped.
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "opencv-python>=4.10",
+    "tqdm>=4.66",
+    # I/O
     "imageio>=2.37.0",
-    "matplotlib",
     "plyfile>=1.1.3",
+    "python-dotenv>=1.0",
+    "requests>=2.32.5",
+]
+
+[project.optional-dependencies]
+# --- torch backends: pick exactly one -------------------------------------
+# Declared as conflicting extras (see [tool.uv]) so uv locks one resolution
+# per backend instead of trying to satisfy all three at once. Without this
+# split the default resolve dragged in the full CUDA 13 wheel set (~15 of
+# them, multiple GB) on every machine, which ruled out ARM Linux entirely and
+# gave Macs a CPU-only torch.
+#
+#   uv sync --extra cpu     lean torch, works on x86-64 and ARM, Linux/Win/Mac
+#   uv sync --extra cuda    NVIDIA build; reconstruction workers only
+#   uv sync --extra mps     macOS; same wheel as cpu, Metal is compiled in
+#
+# `mps` and `cuda` are platform-scoped: asking for the wrong one on the wrong
+# host resolves to nothing rather than failing the lock.
+#
+# torchvision comes along for the ride: the vendored Depth-Anything-v2 code
+# imports `torchvision.transforms` (depth_anything_v2/dpt.py). It was never
+# declared, and depth.py's `except Exception: DepthAnythingV2 = None` masked
+# the ImportError, so that backend silently could not run at all.
+cpu = ["torch>=2.4", "torchvision>=0.19"]
+cuda = [
+    "torch>=2.4; sys_platform == 'linux' or sys_platform == 'win32'",
+    "torchvision>=0.19; sys_platform == 'linux' or sys_platform == 'win32'",
+]
+mps = [
+    "torch>=2.4; sys_platform == 'darwin'",
+    "torchvision>=0.19; sys_platform == 'darwin'",
+]
+
+# Gaussian splat training. Needs the `cuda` extra alongside it:
+#
+#   uv sync --extra cuda --extra splat
+#
+# Kept out of the base install because gsplat JIT-compiles CUDA kernels at
+# import time and therefore needs a host nvcc; with it in `dependencies`, a
+# plain `uv sync` produces an environment where importing the project fails on
+# any machine without the CUDA toolchain. MPO-232 bakes the compiled kernels
+# into the worker image so the runtime host needs no toolchain at all.
+#
+# `packaging` is gsplat's, not ours: gsplat/cuda/_backend.py does
+# `from packaging.version import Version` at import time but does not declare
+# it, so importing gsplat in a clean environment dies with
+# ModuleNotFoundError: No module named 'packaging'. Caught by the worker image
+# build, which is the only place a truly clean install happens.
+splat = ["gsplat>=1.5.3", "packaging>=23.0"]
+
+# Surface extraction (marching cubes) and the mobile AR formats it unblocks.
+# Open3D would be the usual pick for TSDF but publishes no Python 3.13 wheels,
+# and marching cubes is the only part of it needed here.
+mesh = ["scikit-image>=0.24"]
+
+# AR Quick Look on iOS. usd-core is Pixar's USD runtime; DracoPy is a
+# pip-installable Draco encoder, so GLB compression needs no native toolchain.
+ar = ["usd-core>=24.0", "dracopy>=1.3"]
+
+# Job service (MPO-244). httpx is what FastAPI's TestClient needs, so the
+# API is testable without standing a server up.
+service = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9", "httpx>=0.27"]
+
+# S3-compatible object storage (MPO-236). Optional so the base install and
+# the CLI stay dependency-free for local jobs.
+s3 = ["boto3>=1.34"]
+
+# Opt-in only. Nothing downstream consumes SAM2 output today (MPO-230).
+sam2 = ["sam2>=1.1.0"]
+
+# Dev-only debug preview (`fusion/view.py`). Everything here opens a blocking
+# desktop window and needs a display, so none of it can run in the worker
+# container, in a browser, or on a phone — which is why it is not in the base
+# install (MPO-234). The product viewer is the web viewer (MPO-246), reused by
+# the desktop shell (MPO-249) and mobile (MPO-248).
+#
+# pyglet is pinned because that is the version trimesh.show() drives.
+viewer = [
+    "matplotlib>=3.8",
+    "trimesh>=4.9.0",
     "pyglet==1.5.27",
     "pyopengl>=3.1.10",
     "pyopengl-accelerate>=3.1.10",
-    "requests>=2.32.5",
-    "trimesh>=4.9.0",
 ]
+
+[dependency-groups]
+# moto gives a real in-process S3 implementation, so the storage backend is
+# tested against something that behaves like S3 rather than only against a
+# hand-written fake that shares my assumptions.
+dev = ["pytest>=8.0", "moto[s3]>=5.0", "boto3>=1.34"]
+
+[project.scripts]
+# One command for the whole pipeline (MPO-245).
+clipto3d = "cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Flat layout: the stage modules sit at the repo root and import each other by
+# bare name. Listing them explicitly rather than shipping the whole tree keeps
+# tests/, docker/ and job outputs out of the wheel.
+include = [
+    "*.py",
+    "depth_estimation/",
+    "fusion/",
+    "geometry_based_reconstruction/",
+    "neural_reconstruction/",
+    "object_detection/",
+    "point_clouds/",
+    "structure_from_motion/",
+]
+exclude = ["main.py"]
+
+[tool.uv]
+# Installed so `clipto3d` exists as a command. Was `package = false`, which is
+# why [project.scripts] could not work before (MPO-245).
+package = true
+
+# One torch build per environment. Declaring the conflict lets uv keep a
+# separate resolution per extra in a single lockfile.
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }, { extra = "mps" }]]
+
+# `explicit = true`: only requirements that name these indexes below are drawn
+# from them, so the rest of the graph still comes from PyPI.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    # The cpu index carries manylinux aarch64 and macOS arm64 wheels, which is
+    # what unblocks ARM Linux hosts and Apple Silicon.
+    { index = "pytorch-cpu", extra = "cpu" },
+    # macOS torch has Metal compiled in — the cpu wheel *is* the MPS wheel.
+    { index = "pytorch-cpu", extra = "mps" },
+    { index = "pytorch-cu130", extra = "cuda" },
+]
+# torchvision must track torch's build exactly; a PyPI torchvision against a
+# +cu130 torch is an ABI mismatch that only shows up at import time.
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cpu", extra = "mps" },
+    { index = "pytorch-cu130", extra = "cuda" },
+]
+
+[tool.pyright]
+# Same reason as pytest's pythonpath: flat module layout at the repo root.
+extraPaths = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Flat module layout with `package = false`, so the repo root has to be put on
+# sys.path explicitly for `import frames`, `import colmap_io`, etc. to resolve.
+pythonpath = ["."]

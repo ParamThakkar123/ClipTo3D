@@ -1,0 +1,513 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ClipTo3D capture</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; overflow: hidden;
+               font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+               color: #d7dce3; -webkit-user-select: none; user-select: none; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+
+  #hud { position: fixed; inset: 0; display: grid; grid-template-rows: auto 1fr auto;
+         pointer-events: none; padding: max(12px, env(safe-area-inset-top)) 12px
+                 max(12px, env(safe-area-inset-bottom)); }
+  #coach { justify-self: center; padding: 9px 14px; border-radius: 999px;
+           background: #0b0d10cc; backdrop-filter: blur(8px); text-align: center;
+           max-width: min(420px, calc(100vw - 32px)); }
+  #coach.warn { background: #7c2d12dd; }
+  #coach.bad  { background: #7f1d1ddd; }
+  #coach.good { background: #14532ddd; }
+
+  #meters { align-self: end; display: grid; gap: 6px; justify-self: start;
+            padding: 10px 12px; border-radius: 10px; background: #0b0d10cc;
+            backdrop-filter: blur(8px); min-width: 190px; }
+  .meter { display: grid; grid-template-columns: 62px 1fr auto; gap: 8px;
+           align-items: center; font-size: 12px; color: #8b95a3; }
+  .meter .track { height: 4px; border-radius: 2px; background: #232b35; overflow: hidden; }
+  .meter .track > span { display: block; height: 100%; width: 0; background: #2b6cb0;
+                         transition: width .15s linear; }
+  .meter.ok .track > span { background: #22c55e; }
+  .meter.bad .track > span { background: #ef4444; }
+
+  #controls { justify-self: center; align-self: end; display: flex; gap: 12px;
+              align-items: center; pointer-events: auto; margin-top: 10px; }
+  button { font: inherit; padding: 10px 18px; border-radius: 999px; cursor: pointer;
+           background: #1d242e; color: #d7dce3; border: 1px solid #2d3743; }
+  button:disabled { opacity: .45; cursor: default; }
+  #rec { width: 68px; height: 68px; border-radius: 50%; background: #ef4444;
+         border: 4px solid #fff3; padding: 0; }
+  #rec[data-recording="true"] { border-radius: 14px; background: #f87171; }
+
+  #panel { position: fixed; inset: auto 12px 12px 12px; padding: 12px;
+           border-radius: 10px; background: #151a21f2; border: 1px solid #262d37;
+           pointer-events: auto; display: none; }
+  #panel.on { display: block; }
+  #panel .row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;
+                align-items: center; }
+  input, select { font: inherit; padding: 6px 8px; border-radius: 6px; min-width: 0;
+                  background: #11161d; color: #d7dce3; border: 1px solid #2d3743; }
+  #bar { height: 4px; border-radius: 2px; background: #232b35; margin-top: 10px;
+         overflow: hidden; }
+  #bar > span { display: block; height: 100%; width: 0; background: #2b6cb0; }
+  #note { color: #8b95a3; font-size: 12px; margin-top: 6px; }
+  #err { color: #ff8f8f; margin-top: 6px; }
+  a { color: #6fb3ff; }
+</style>
+
+<video id="preview" playsinline muted autoplay></video>
+
+<div id="hud">
+  <div id="coach">grant camera access to begin</div>
+  <div></div>
+  <div>
+    <div id="meters">
+      <div class="meter" id="m-sharp"><span>sharpness</span><span class="track"><span></span></span><b>–</b></div>
+      <div class="meter" id="m-move"><span>movement</span><span class="track"><span></span></span><b>–</b></div>
+      <div class="meter" id="m-cover"><span>coverage</span><span class="track"><span></span></span><b>–</b></div>
+    </div>
+    <div id="controls">
+      <button id="flip" type="button" title="switch camera">flip</button>
+      <button id="rec" type="button" aria-label="record"></button>
+      <button id="settings" type="button">setup</button>
+    </div>
+  </div>
+</div>
+
+<div id="panel">
+  <div class="row">
+    <input id="key" type="password" placeholder="API key" autocomplete="off" aria-label="API key" size="12">
+    <select id="quality" aria-label="quality">
+      <option value="preview">preview</option>
+      <option value="balanced" selected>balanced</option>
+      <option value="final">final</option>
+    </select>
+    <label><input id="autoupload" type="checkbox" checked> upload when done</label>
+  </div>
+  <div id="bar" hidden><span></span></div>
+  <div id="note"></div>
+  <div id="err"></div>
+</div>
+
+<script type="module">
+// Guided capture for the browser (MPO-247).
+//
+// The phone's job is capture, not compute — and capture is where
+// reconstruction quality is actually decided. Users given no guidance produce
+// clips COLMAP cannot solve, so this coaches against the three failure modes
+// that actually kill a reconstruction:
+//
+//   motion blur          — panning faster than the sensor's exposure
+//   no parallax          — spinning on the spot, which yields no depth at all
+//   too few viewpoints   — a few seconds from one angle
+//
+// A web client rather than a native app: it runs on both platforms today and
+// shares the viewer's code and deployment. What it cannot reach is ARKit and
+// ARCore pose, which the issue rightly wants — see the note at the bottom.
+
+// --- metrics --------------------------------------------------------------
+
+// Variance of the Laplacian, the same sharpness proxy `keyframes.py` uses to
+// select frames server-side. Coaching against the metric that later judges
+// the footage is the point: a clip that passes here is a clip whose frames
+// survive selection.
+function varianceOfLaplacian(gray, w, h) {
+  let sum = 0, sumSq = 0, n = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const lap = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w];
+      sum += lap; sumSq += lap * lap; n++;
+    }
+  }
+  if (!n) return 0;
+  const mean = sum / n;
+  return sumSq / n - mean * mean;
+}
+
+// Mean absolute difference between consecutive frames, normalised to 0..1.
+// A cheap stand-in for optical flow: it says the view changed, not how.
+function frameMotion(prev, curr) {
+  if (!prev || prev.length !== curr.length) return 0;
+  let acc = 0;
+  for (let i = 0; i < curr.length; i++) acc += Math.abs(curr[i] - prev[i]);
+  return acc / curr.length / 255;
+}
+
+// The distinction that matters, and the one a camera alone cannot make.
+//
+// Pure rotation produces plenty of frame-to-frame motion and zero parallax —
+// it is the most common user instinct and it cannot be reconstructed. The
+// gyroscope separates the two directly: high rotation rate with motion that
+// is explained by it means the user is spinning on the spot.
+function isRotationDominated(rotationRateDegPerSec, motion, { minRate = 25, ratio = 900 } = {}) {
+  if (rotationRateDegPerSec == null) return false;   // no sensor: cannot judge
+  if (rotationRateDegPerSec < minRate) return false;
+  // Motion the rotation alone would explain. Translating as well pushes the
+  // observed motion above it.
+  return motion * ratio < rotationRateDegPerSec;
+}
+
+// How much of a full orbit the capture has covered, from compass heading.
+// Reconstruction wants viewpoints spread around the subject, and 36 buckets
+// of 10 degrees is enough resolution to tell an orbit from a wobble.
+const HEADING_BUCKETS = 36;
+
+function coverageFraction(buckets) {
+  let seen = 0;
+  for (const b of buckets) if (b) seen++;
+  return seen / HEADING_BUCKETS;
+}
+
+function headingBucket(headingDeg) {
+  if (headingDeg == null || !Number.isFinite(headingDeg)) return null;
+  const wrapped = ((headingDeg % 360) + 360) % 360;
+  return Math.min(HEADING_BUCKETS - 1, Math.floor(wrapped / (360 / HEADING_BUCKETS)));
+}
+
+// --- coaching -------------------------------------------------------------
+
+const MIN_SHARPNESS = 40;     // below this, frames are blurred beyond use
+const MIN_MOTION = 0.006;     // below this, the camera is effectively still
+const MAX_MOTION = 0.11;      // above this, the shutter cannot keep up
+const MIN_SECONDS = 12;
+const MIN_COVERAGE = 0.35;
+
+// One message at a time, worst problem first. A HUD that lists four
+// simultaneous complaints gets ignored.
+function captureAdvice(s) {
+  if (!s.recording) {
+    return s.sharpness < MIN_SHARPNESS
+      ? { level: 'warn', text: 'hold steady — the preview is blurred' }
+      : { level: 'info', text: 'walk around the subject, keep it centred' };
+  }
+  if (s.sharpness < MIN_SHARPNESS) return { level: 'bad', text: 'too blurred — slow down' };
+  if (s.motion > MAX_MOTION) return { level: 'bad', text: 'moving too fast — slow down' };
+  if (s.rotationDominated) {
+    return { level: 'bad', text: 'you are turning on the spot — walk around the subject instead' };
+  }
+  if (s.motion < MIN_MOTION) return { level: 'warn', text: 'keep moving — hold-stills add nothing' };
+  if (s.seconds < MIN_SECONDS) {
+    return { level: 'info', text: `keep going — ${Math.ceil(MIN_SECONDS - s.seconds)}s more` };
+  }
+  if (s.coverage < MIN_COVERAGE) {
+    return { level: 'info', text: 'keep circling — more angles than this are needed' };
+  }
+  return { level: 'good', text: 'good coverage — close the loop back to the start' };
+}
+
+// Judged after the fact, so a clip that cannot reconstruct is not uploaded
+// with a straight face. `coverage` is null when the device has no compass.
+function captureVerdict(s) {
+  const problems = [];
+  if (s.seconds < MIN_SECONDS) problems.push(`only ${s.seconds.toFixed(0)}s — aim for ${MIN_SECONDS}s+`);
+  if (s.blurFraction > 0.4) problems.push('most frames are motion-blurred');
+  if (s.rotationFraction > 0.5) problems.push('mostly rotation, not movement — there is no parallax to solve');
+  if (s.coverage !== null && s.coverage < 0.2) problems.push('too few distinct viewpoints');
+  return { usable: problems.length === 0, problems };
+}
+
+// --- resumable upload -----------------------------------------------------
+//
+// Mobile networks drop and the OS suspends backgrounded tabs. Re-sending a
+// 200 MB clip from zero is the difference between working on a phone and not,
+// so the client always asks the server where it got to rather than assuming.
+
+async function uploadResumable(api, blob, filename, {
+  onProgress = () => {},
+  chunkSize = 4 * 1024 * 1024,
+  retries = 6,
+  sleep = ms => new Promise(r => setTimeout(r, ms)),
+  signal = null,
+} = {}) {
+  const started = await api(
+    `/uploads/resumable?filename=${encodeURIComponent(filename)}&total=${blob.size}`,
+    { method: 'POST' });
+  const id = started.upload_id;
+  let offset = started.offset || 0;
+  chunkSize = started.chunk_size || chunkSize;
+
+  let attempt = 0;
+  while (offset < blob.size) {
+    if (signal?.aborted) throw new Error('cancelled');
+    const end = Math.min(offset + chunkSize, blob.size);
+    try {
+      const res = await api(`/uploads/${id}?offset=${offset}`,
+                            { method: 'PATCH', body: blob.slice(offset, end) });
+      offset = res.offset;
+      attempt = 0;
+      onProgress(offset / blob.size);
+    } catch (e) {
+      // 409 means the server is at a different offset — a chunk landed that
+      // we never got the ack for. Re-sync instead of retrying blindly, which
+      // would loop forever against a replayed chunk.
+      if (e.status === 409 && typeof e.offset === 'number') {
+        offset = e.offset;
+        continue;
+      }
+      if (++attempt > retries) throw e;
+      await sleep(Math.min(8000, 400 * 2 ** (attempt - 1)));
+      // Re-read the truth from the server; a partial write may have landed.
+      const state = await api(`/uploads/${id}`).catch(() => null);
+      if (state) offset = state.offset;
+    }
+  }
+  return id;
+}
+
+// --- wiring ---------------------------------------------------------------
+
+const video = document.getElementById('preview');
+const coach = document.getElementById('coach');
+const panel = document.getElementById('panel');
+const keyEl = document.getElementById('key');
+const qualityEl = document.getElementById('quality');
+const autoEl = document.getElementById('autoupload');
+const recEl = document.getElementById('rec');
+const flipEl = document.getElementById('flip');
+const barEl = document.getElementById('bar');
+const noteEl = document.getElementById('note');
+const errEl = document.getElementById('err');
+
+keyEl.value = localStorage.getItem('clipto3d.key') || '';
+keyEl.onchange = () => localStorage.setItem('clipto3d.key', keyEl.value);
+document.getElementById('settings').onclick = () => panel.classList.toggle('on');
+
+async function api(path, init = {}) {
+  const res = await fetch(path, {
+    ...init,
+    headers: { 'X-API-Key': keyEl.value, ...(init.headers || {}) },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(body.detail || `${res.status} ${res.statusText}`);
+    err.status = res.status;
+    if (typeof body.offset === 'number') err.offset = body.offset;
+    throw err;
+  }
+  return body;
+}
+
+// --- camera ---------------------------------------------------------------
+
+let stream = null, facing = 'environment', recorder = null, chunks = [];
+// A fatal camera error must survive the analysis loop's coaching.
+let fatal = null;
+
+async function openCamera() {
+  try {
+    stream?.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      // The rear camera, and a resolution COLMAP can work with. Higher is not
+      // better here: 4K costs upload time and buys little for feature matching.
+      video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 },
+               frameRate: { ideal: 30 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play().catch(() => {});   // some browsers need this explicitly
+    fatal = null;
+    setCoach({ level: 'info', text: 'walk around the subject, keep it centred' });
+  } catch (e) {
+    // Sticky: the analysis loop runs every frame and would otherwise overwrite
+    // this within ~16ms, leaving a dead camera looking like a blurred one.
+    fatal = { level: 'bad', text: `camera unavailable: ${e.name}: ${e.message}` };
+    setCoach(fatal);
+    recEl.disabled = true;
+  }
+}
+
+flipEl.onclick = () => { facing = facing === 'environment' ? 'user' : 'environment'; openCamera(); };
+
+// --- live analysis --------------------------------------------------------
+
+const ANALYSIS_W = 96, ANALYSIS_H = 54;
+const scratch = document.createElement('canvas');
+scratch.width = ANALYSIS_W; scratch.height = ANALYSIS_H;
+const ctx = scratch.getContext('2d', { willReadFrequently: true });
+
+let prevGray = null;
+let rotationRate = null;
+const buckets = new Uint8Array(HEADING_BUCKETS);
+let heading = null;
+const state = { recording: false, sharpness: 0, motion: 0, coverage: 0,
+                seconds: 0, rotationDominated: false };
+let startedAt = 0, blurFrames = 0, rotFrames = 0, totalFrames = 0;
+
+function grayscale() {
+  if (!video.videoWidth) return null;
+  ctx.drawImage(video, 0, 0, ANALYSIS_W, ANALYSIS_H);
+  const { data } = ctx.getImageData(0, 0, ANALYSIS_W, ANALYSIS_H);
+  const gray = new Float32Array(ANALYSIS_W * ANALYSIS_H);
+  for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
+    gray[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+  }
+  return gray;
+}
+
+function analyse() {
+  const gray = grayscale();
+  if (gray) {
+    state.sharpness = varianceOfLaplacian(gray, ANALYSIS_W, ANALYSIS_H);
+    state.motion = frameMotion(prevGray, gray);
+    prevGray = gray;
+    state.rotationDominated = isRotationDominated(rotationRate, state.motion);
+
+    if (state.recording) {
+      totalFrames++;
+      if (state.sharpness < MIN_SHARPNESS) blurFrames++;
+      if (state.rotationDominated) rotFrames++;
+      const b = headingBucket(heading);
+      if (b !== null) buckets[b] = 1;
+      state.coverage = coverageFraction(buckets);
+      state.seconds = (performance.now() - startedAt) / 1000;
+    }
+  }
+  if (!fatal) setCoach(captureAdvice(state));
+  meter('m-sharp', Math.min(1, state.sharpness / 200), state.sharpness >= MIN_SHARPNESS,
+        state.sharpness.toFixed(0));
+  meter('m-move', Math.min(1, state.motion / MAX_MOTION),
+        state.motion >= MIN_MOTION && state.motion <= MAX_MOTION,
+        state.motion.toFixed(3));
+  meter('m-cover', state.coverage, state.coverage >= MIN_COVERAGE,
+        heading === null ? 'n/a' : `${Math.round(state.coverage * 100)}%`);
+  requestAnimationFrame(analyse);
+}
+
+function meter(id, fraction, ok, label) {
+  const el = document.getElementById(id);
+  el.querySelector('.track > span').style.width = `${Math.max(0, Math.min(1, fraction)) * 100}%`;
+  el.classList.toggle('ok', !!ok);
+  el.classList.toggle('bad', !ok && state.recording);
+  el.querySelector('b').textContent = label;
+}
+
+function setCoach(advice) {
+  coach.textContent = advice.text;
+  coach.className = advice.level;
+}
+
+// Sensors. Both are optional — without them the client still coaches on blur
+// and movement, it just cannot tell rotation from translation.
+addEventListener('devicemotion', e => {
+  const r = e.rotationRate;
+  if (!r) return;
+  rotationRate = Math.hypot(r.alpha || 0, r.beta || 0, r.gamma || 0);
+}, { passive: true });
+
+addEventListener('deviceorientationabsolute', e => {
+  if (e.absolute && e.alpha != null) heading = e.alpha;
+}, { passive: true });
+addEventListener('deviceorientation', e => {
+  // iOS exposes the compass separately and does not fire the absolute event.
+  if (e.webkitCompassHeading != null) heading = e.webkitCompassHeading;
+  else if (heading === null && e.absolute && e.alpha != null) heading = e.alpha;
+}, { passive: true });
+
+// iOS 13+ requires a user gesture before it will hand over motion sensors.
+async function requestSensors() {
+  for (const cls of [window.DeviceMotionEvent, window.DeviceOrientationEvent]) {
+    if (cls && typeof cls.requestPermission === 'function') {
+      await cls.requestPermission().catch(() => {});
+    }
+  }
+}
+
+// --- recording ------------------------------------------------------------
+
+function pickMimeType() {
+  // Safari writes MP4; Chrome and Firefox write WebM. The service accepts
+  // both, so take whichever the browser actually supports rather than
+  // insisting on one and failing on half the devices.
+  const candidates = ['video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  for (const t of candidates) {
+    if (window.MediaRecorder?.isTypeSupported?.(t)) return t;
+  }
+  return '';
+}
+
+recEl.onclick = async () => {
+  if (state.recording) { recorder.stop(); return; }
+  if (!stream) return;
+  await requestSensors();
+
+  chunks = [];
+  buckets.fill(0);
+  blurFrames = rotFrames = totalFrames = 0;
+  const mime = pickMimeType();
+  recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => finishRecording(mime);
+  // Timeslice so a crash or a backgrounded tab does not lose everything.
+  recorder.start(1000);
+
+  startedAt = performance.now();
+  state.recording = true;
+  recEl.dataset.recording = 'true';
+};
+
+async function finishRecording(mime) {
+  state.recording = false;
+  recEl.dataset.recording = 'false';
+  const seconds = (performance.now() - startedAt) / 1000;
+  const blob = new Blob(chunks, { type: mime || 'video/webm' });
+
+  const verdict = captureVerdict({
+    seconds,
+    blurFraction: totalFrames ? blurFrames / totalFrames : 0,
+    rotationFraction: totalFrames ? rotFrames / totalFrames : 0,
+    coverage: heading === null ? null : coverageFraction(buckets),
+  });
+
+  panel.classList.add('on');
+  const size = `${(blob.size / 1e6).toFixed(1)} MB, ${seconds.toFixed(0)}s`;
+  if (!verdict.usable) {
+    noteEl.innerHTML = `<b>this clip will probably not reconstruct</b><br>` +
+      verdict.problems.map(p => `• ${p}`).join('<br>') +
+      `<br>${size} — you can upload it anyway.`;
+  } else {
+    noteEl.textContent = `looks good: ${size}`;
+  }
+
+  // Always offer the download: a capture the network ate should not be lost.
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `capture.${mime.includes('mp4') ? 'mp4' : 'webm'}`;
+  a.textContent = 'save the clip';
+  noteEl.append(document.createElement('br'), a);
+
+  if (autoEl.checked && keyEl.value) await upload(blob, a.download);
+}
+
+async function upload(blob, filename) {
+  errEl.textContent = '';
+  barEl.hidden = false;
+  try {
+    const id = await uploadResumable(api, blob, filename, {
+      onProgress: f => { barEl.firstElementChild.style.width = `${(f * 100).toFixed(1)}%`; },
+    });
+    const job = await api(`/uploads/${id}/job?quality=${encodeURIComponent(qualityEl.value)}`,
+                          { method: 'POST' });
+    noteEl.append(document.createElement('br'));
+    const link = document.createElement('a');
+    link.href = `/viewer?job=${job.id}`;
+    link.textContent = `job ${job.id} queued — open the viewer`;
+    noteEl.append(link);
+  } catch (e) {
+    errEl.textContent = `upload failed: ${e.message}. The clip is still saveable above.`;
+  }
+}
+
+openCamera();
+requestAnimationFrame(analyse);
+
+// Exposed for the test suite, which runs these under Node against synthetic
+// frames rather than needing a camera.
+window.__capture = {
+  varianceOfLaplacian, frameMotion, isRotationDominated,
+  coverageFraction, headingBucket, captureAdvice, captureVerdict,
+  uploadResumable, pickMimeType,
+  get state() { return state; },
+};
+</script>

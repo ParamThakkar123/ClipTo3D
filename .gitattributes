@@ -1,3 +1,11 @@
+# Files that only ever run inside a Linux container. A CRLF checkout on
+# Windows puts a `\r` at the end of every line, and `sh` reports that as a
+# syntax error somewhere in the entrypoint rather than as a line-ending
+# problem — an expensive half hour if it reaches CI.
+*.sh text eol=lf
+Dockerfile* text eol=lf
+Caddyfile text eol=lf
+
 *.mp4 filter=lfs diff=lfs merge=lfs -text
 *.pth filter=lfs diff=lfs merge=lfs -text
 *.pt filter=lfs diff=lfs merge=lfs -text

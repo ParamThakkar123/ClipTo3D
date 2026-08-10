@@ -1,0 +1,101 @@
+# check=skip=SecretsUsedInArgOrEnv
+#
+# (That directive must precede every other line, comments included, or the
+# parser does not see it. It silences a false positive on CLIPTO3D_AUTH, which
+# is a mode name — `strict` or `open` — that the checker matches because the
+# identifier contains "AUTH". The real secret, CLIPTO3D_BOOTSTRAP_KEY, is
+# passed at run time and never baked into a layer.)
+
+# The API, and only the API.
+#
+# `docker/Dockerfile` builds the *worker*: CUDA, a source build of COLMAP,
+# torch and the depth checkpoints, ~5 GB. None of that belongs in the process
+# that answers HTTP. This image is the base install plus FastAPI — it never
+# imports torch, never shells out to COLMAP, and starts in under a second, so
+# a reconstruction that OOMs cannot take the API down with it.
+#
+# The two share a jobs directory and coordinate through the lease queue in
+# `job_registry.py`; see docker/docker-compose.yml.
+#
+#   docker build -f docker/Dockerfile.service -t clipto3d-api .
+#   docker run -p 8000:8000 -v "$PWD/runs:/data" \
+#       -e CLIPTO3D_BOOTSTRAP_KEY=... clipto3d-api
+
+# CLIPTO3D_AUTH is a mode name, not a credential; the checker matches on
+# "AUTH" in the identifier. The real secret, CLIPTO3D_BOOTSTRAP_KEY, is passed
+# at run time and never baked into a layer.
+# check=skip=SecretsUsedInArgOrEnv
+
+# Matches .python-version. It has to: `COPY . /app` brings that file into the
+# build, and uv then insists on the interpreter it names.
+ARG PYTHON_VERSION=3.13
+
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    # Belt and braces: pin uv to this image's interpreter so overriding
+    # PYTHON_VERSION cannot resurrect the .python-version mismatch above.
+    # UV_PYTHON takes precedence over the file.
+    UV_PYTHON=/usr/local/bin/python
+
+WORKDIR /app
+
+# Dependencies resolve from the lockfile alone, so this layer caches across
+# every source change. `--no-install-project` is what keeps it that way.
+COPY pyproject.toml uv.lock README.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project --extra service --extra s3
+
+COPY . /app
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --extra service --extra s3
+
+
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+# curl for the healthcheck below; nothing else is needed at runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Never run the public-facing process as root. The uid is fixed so the data
+# volume can be chowned to it from outside the container.
+RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin clipto3d
+
+WORKDIR /app
+COPY --from=builder --chown=root:root /app /app
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CLIPTO3D_JOBS_ROOT=/data \
+    # The API process serves; dedicated worker containers reconstruct. Set
+    # this to 1 for an all-in-one deployment on the worker image instead.
+    CLIPTO3D_WORKERS=0 \
+    CLIPTO3D_AUTH=strict
+
+# Owned by the service user, and declared so a bare `docker run` still gets a
+# writable location rather than failing on the first upload.
+RUN mkdir -p /data && chown clipto3d:clipto3d /data
+VOLUME ["/data"]
+
+USER clipto3d
+EXPOSE 8000
+
+# Fails the container when the queue is unreachable, not merely when the port
+# is open — a service that cannot read its own database is not healthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+
+# One worker process: the SQLite registry coordinates threads and processes on
+# one host, and uvicorn's own concurrency is enough for an API whose slow path
+# is disk. Scale reconstruction by adding worker containers, not API replicas.
+#
+# Run through `sh` rather than relying on the executable bit, which does not
+# survive every checkout. Extra arguments are forwarded to uvicorn, so
+# `docker run … --log-level debug` still works.
+ENTRYPOINT ["sh", "/app/docker/api-entrypoint.sh"]

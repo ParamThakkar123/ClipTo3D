@@ -1,0 +1,1042 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ClipTo3D viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; overflow: hidden;
+               font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; color: #d7dce3; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #hud { position: fixed; top: 12px; left: 12px; padding: 10px 12px; border-radius: 8px;
+         background: #151a21cc; backdrop-filter: blur(8px); border: 1px solid #262d37;
+         max-width: min(340px, calc(100vw - 24px)); }
+  #hud h1 { margin: 0 0 6px; font-size: 13px; font-weight: 600; letter-spacing: .01em; }
+  #stats { color: #8b95a3; white-space: pre-line; font-variant-numeric: tabular-nums; }
+  #err { color: #ff8f8f; margin-top: 6px; }
+  .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  button { font: inherit; padding: 4px 9px; border-radius: 6px; cursor: pointer;
+           background: #1d242e; color: #d7dce3; border: 1px solid #2d3743; }
+  button[aria-pressed="true"] { background: #2b6cb0; border-color: #3b82c4; color: #fff; }
+  #drop { position: fixed; inset: 0; display: none; place-items: center;
+          background: #0b0d10d0; font-size: 15px; }
+  #drop.on { display: grid; }
+
+  input { font: inherit; padding: 4px 7px; border-radius: 6px; min-width: 0;
+          background: #11161d; color: #d7dce3; border: 1px solid #2d3743; }
+  input[type=file] { padding: 3px; }
+  #job { margin-top: 10px; border-top: 1px solid #262d37; padding-top: 9px; }
+  #job summary { cursor: pointer; color: #8b95a3; }
+  #stages { margin-top: 8px; display: grid; gap: 3px; }
+  .stage { display: grid; grid-template-columns: 1fr auto; gap: 8px;
+           font-variant-numeric: tabular-nums; }
+  .stage b { font-weight: 500; }
+  .stage[data-status=done] b { color: #7fd1a0; }
+  .stage[data-status=running] b { color: #6fb3ff; }
+  .stage[data-status=failed] b, .stage[data-status=cancelled] b { color: #ff8f8f; }
+  .stage[data-status=pending] { opacity: .5; }
+  .stage i { color: #6b7686; font-style: normal; }
+  #ar { color: #8b95a3; }
+  #ar a { display: inline-flex; align-items: center; gap: 5px; text-decoration: none;
+          padding: 4px 9px; border-radius: 6px; background: #2b6cb0; color: #fff;
+          border: 1px solid #3b82c4; }
+  #bar { height: 3px; border-radius: 2px; background: #232b35; margin-top: 8px;
+         overflow: hidden; }
+  #bar > span { display: block; height: 100%; width: 0; background: #2b6cb0;
+                transition: width .25s ease; }
+</style>
+
+<canvas id="gl"></canvas>
+<div id="hud">
+  <h1>ClipTo3D viewer</h1>
+  <div id="stats">drop a .glb export here</div>
+  <div id="err"></div>
+  <div class="row" id="lods"></div>
+  <div class="row" id="ar" hidden></div>
+
+  <details id="job">
+    <summary>reconstruct a video</summary>
+    <div class="row">
+      <input id="key" type="password" placeholder="API key" autocomplete="off"
+             aria-label="API key" size="14">
+      <select id="quality" aria-label="quality">
+        <option value="preview">preview</option>
+        <option value="balanced" selected>balanced</option>
+        <option value="final">final</option>
+      </select>
+    </div>
+    <div class="row">
+      <input id="video" type="file" accept="video/*" aria-label="video file">
+      <button id="go" type="button">reconstruct</button>
+      <button id="stop" type="button" hidden>cancel</button>
+    </div>
+    <div id="bar" hidden><span></span></div>
+    <div id="stages"></div>
+  </details>
+</div>
+<div id="drop">release to load</div>
+
+<script type="module">
+// A dependency-free WebGL2 renderer for the exports written by export.py:
+// point clouds and meshes from GLB, and gaussian splats from .splat, the
+// latter through a real EWA conic rasteriser with back-to-front compositing.
+//
+// No three.js. A self-contained file is what the desktop shell (MPO-249) and
+// mobile WebView (MPO-248) can embed without a build step, and the renderer
+// itself is a handful of shaders and one draw call per frame.
+
+const canvas = document.getElementById('gl');
+const statsEl = document.getElementById('stats');
+const errEl = document.getElementById('err');
+const lodsEl = document.getElementById('lods');
+const dropEl = document.getElementById('drop');
+
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+if (!gl) {
+  errEl.textContent = 'WebGL2 unavailable in this browser.';
+  throw new Error('no webgl2');
+}
+
+// --- capability tiering ---------------------------------------------------
+// Pick an LOD from what the device can plausibly sustain rather than always
+// attempting the full asset: a low-end phone loading 5M points fails slowly,
+// which is worse than loading a coarse level immediately.
+function deviceTier() {
+  const mem = navigator.deviceMemory || 4;
+  const cores = navigator.hardwareConcurrency || 4;
+  const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if (mobile && (mem <= 4 || cores <= 4)) return 2;
+  if (mobile || mem <= 4) return 1;
+  return 0;
+}
+
+// --- GLB parsing ----------------------------------------------------------
+function parseGLB(buffer) {
+  const dv = new DataView(buffer);
+  if (dv.getUint32(0, true) !== 0x46546c67) throw new Error('not a GLB file');
+  if (dv.getUint32(4, true) !== 2) throw new Error('only glTF 2.0 is supported');
+
+  let offset = 12, json = null, bin = null;
+  while (offset < dv.byteLength) {
+    const len = dv.getUint32(offset, true);
+    const type = dv.getUint32(offset + 4, true);
+    const body = buffer.slice(offset + 8, offset + 8 + len);
+    if (type === 0x4e4f534a) json = JSON.parse(new TextDecoder().decode(body));
+    else if (type === 0x004e4942) bin = body;
+    offset += 8 + len;
+  }
+  if (!json) throw new Error('GLB has no JSON chunk');
+  return { json, bin: bin || new ArrayBuffer(0) };
+}
+
+const COMPONENT = {
+  5120: Int8Array, 5121: Uint8Array, 5122: Int16Array,
+  5123: Uint16Array, 5125: Uint32Array, 5126: Float32Array,
+};
+const NCOMP = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 };
+
+function readAccessor(gltf, bin, index) {
+  const acc = gltf.accessors[index];
+  const view = gltf.bufferViews[acc.bufferView];
+  const Type = COMPONENT[acc.componentType];
+  const n = NCOMP[acc.type];
+  const base = (view.byteOffset || 0) + (acc.byteOffset || 0);
+  // byteStride matters: export.py pads int16 positions to an 8-byte stride
+  // for glTF's 4-byte alignment rule, so a naive contiguous read is wrong.
+  const stride = view.byteStride || n * Type.BYTES_PER_ELEMENT;
+  const elems = stride / Type.BYTES_PER_ELEMENT;
+
+  const src = new Type(bin, base, acc.count * elems);
+  if (elems === n) return src;
+  const out = new Type(acc.count * n);
+  for (let i = 0; i < acc.count; i++)
+    for (let c = 0; c < n; c++) out[i * n + c] = src[i * elems + c];
+  return out;
+}
+
+function normalizeFactor(componentType) {
+  return { 5120: 127, 5121: 255, 5122: 32767, 5123: 65535 }[componentType] || 1;
+}
+
+function loadPointCloud(buffer) {
+  const { json: gltf, bin } = parseGLB(buffer);
+  const prim = gltf.meshes?.[0]?.primitives?.[0];
+  if (!prim) throw new Error('GLB contains no mesh');
+  if (prim.mode !== 0) throw new Error(`expected POINTS (mode 0), got mode ${prim.mode}`);
+
+  const posAcc = gltf.accessors[prim.attributes.POSITION];
+  const raw = readAccessor(gltf, bin, prim.attributes.POSITION);
+  const count = posAcc.count;
+
+  // Dequantise, then fold in the node transform export.py used to encode the
+  // bounding box.
+  const positions = new Float32Array(count * 3);
+  const f = posAcc.normalized ? normalizeFactor(posAcc.componentType) : 1;
+  const node = gltf.nodes?.[0] || {};
+  const s = node.scale || [1, 1, 1];
+  const t = node.translation || [0, 0, 0];
+  for (let i = 0; i < count; i++)
+    for (let c = 0; c < 3; c++)
+      positions[i * 3 + c] = (raw[i * 3 + c] / f) * s[c] + t[c];
+
+  let colors = null;
+  if (prim.attributes.COLOR_0 !== undefined) {
+    const cAcc = gltf.accessors[prim.attributes.COLOR_0];
+    const cRaw = readAccessor(gltf, bin, prim.attributes.COLOR_0);
+    const cf = cAcc.normalized ? normalizeFactor(cAcc.componentType) : 1;
+    const n = NCOMP[cAcc.type];
+    colors = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++)
+      for (let c = 0; c < 3; c++) colors[i * 3 + c] = cRaw[i * n + c] / cf;
+  }
+  return { positions, colors, count };
+}
+
+// --- .splat parsing -------------------------------------------------------
+// 32 bytes per gaussian: position 3f, scale 3f, RGBA u8, rotation u8.
+// export.py already writes them ordered by size*opacity, so a truncated read
+// is a valid coarse level rather than a random subset.
+const SPLAT_RECORD_BYTES = 32;
+
+function loadSplat(buffer, maxCount = Infinity) {
+  const total = Math.floor(buffer.byteLength / SPLAT_RECORD_BYTES);
+  if (total === 0) throw new Error('empty .splat file');
+  const count = Math.min(total, maxCount);
+
+  const f32 = new Float32Array(buffer);
+  const u8 = new Uint8Array(buffer);
+  const positions = new Float32Array(count * 3);
+  const scales = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const alphas = new Float32Array(count);
+  const quats = new Float32Array(count * 4);
+
+  for (let i = 0; i < count; i++) {
+    const f = i * 8;              // 32 bytes = 8 floats
+    const b = i * SPLAT_RECORD_BYTES;
+    for (let c = 0; c < 3; c++) {
+      positions[i * 3 + c] = f32[f + c];
+      scales[i * 3 + c] = f32[f + 3 + c];
+      colors[i * 3 + c] = u8[b + 24 + c] / 255;
+    }
+    alphas[i] = u8[b + 27] / 255;
+    for (let c = 0; c < 4; c++) quats[i * 4 + c] = (u8[b + 28 + c] - 128) / 128;
+  }
+  return { positions, scales, colors, alphas, quats, count, total };
+}
+
+// --- renderer -------------------------------------------------------------
+//
+// Two programs share one canvas:
+//
+//   POINTS  round sprites, for .glb point clouds.
+//   SPLAT   a real gaussian rasteriser — each gaussian's 3D covariance is
+//           projected to a 2D conic and evaluated per fragment, so splats are
+//           oriented ellipses rather than round dots, and they are drawn
+//           back-to-front so alpha compositing is correct.
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+const POINT_VS = `#version 300 es
+in vec3 aPos; in vec3 aCol;
+uniform mat4 uProj, uView; uniform float uSize;
+out vec3 vCol;
+void main() {
+  vec4 mv = uView * vec4(aPos, 1.0);
+  gl_Position = uProj * mv;
+  // Perspective-correct size: near points get bigger, which is what makes a
+  // sparse cloud read as a surface rather than as confetti.
+  gl_PointSize = clamp(uSize / max(-mv.z, 0.001), 1.0, 32.0);
+  vCol = aCol;
+}`;
+
+const POINT_FS = `#version 300 es
+precision mediump float;
+in vec3 vCol; out vec4 outColor;
+void main() {
+  vec2 d = gl_PointCoord - vec2(0.5);
+  if (dot(d, d) > 0.25) discard;
+  outColor = vec4(vCol, 1.0);
+}`;
+
+// The gaussian path. This is the EWA splatting projection: build the 3D
+// covariance from scale and rotation, push it through the projection
+// Jacobian, and invert the resulting 2D covariance into a conic that the
+// fragment shader evaluates.
+const SPLAT_VS = `#version 300 es
+in vec3 aPos; in vec3 aCol; in vec3 aScale; in vec4 aQuat; in float aAlpha;
+uniform mat4 uProj, uView;
+uniform vec2 uFocal;          // focal length in pixels
+uniform vec2 uViewport;       // drawing buffer size in pixels
+out vec3 vCol; out float vAlpha; out vec3 vConic; out float vRadius;
+
+mat3 quatToMat(vec4 q) {
+  // .splat packs (w, x, y, z).
+  float w = q.x, x = q.y, y = q.z, z = q.w;
+  return mat3(
+    1.0 - 2.0*(y*y + z*z), 2.0*(x*y + w*z),       2.0*(x*z - w*y),
+    2.0*(x*y - w*z),       1.0 - 2.0*(x*x + z*z), 2.0*(y*z + w*x),
+    2.0*(x*z + w*y),       2.0*(y*z - w*x),       1.0 - 2.0*(x*x + y*y));
+}
+
+void main() {
+  vec4 mv = uView * vec4(aPos, 1.0);
+  // Behind the camera: the Jacobian is singular there, and projecting anyway
+  // produces enormous garbage ellipses across the screen.
+  if (mv.z > -0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  gl_Position = uProj * mv;
+
+  mat3 R = quatToMat(aQuat);
+  mat3 S = mat3(aScale.x, 0.0, 0.0, 0.0, aScale.y, 0.0, 0.0, 0.0, aScale.z);
+  mat3 M = R * S;
+  mat3 sigma = M * transpose(M);              // 3D covariance
+
+  float z = mv.z;
+  // Jacobian of the perspective projection at this point.
+  mat3 J = mat3(
+    uFocal.x / -z, 0.0,           0.0,
+    0.0,           uFocal.y / -z, 0.0,
+    uFocal.x * mv.x / (z*z), uFocal.y * mv.y / (z*z), 0.0);
+  mat3 T = J * mat3(uView);
+  mat3 cov = T * sigma * transpose(T);
+
+  // Dilate slightly so a gaussian thinner than a pixel still shows up rather
+  // than aliasing into nothing.
+  float a = cov[0][0] + 0.3;
+  float b = cov[0][1];
+  float c = cov[1][1] + 0.3;
+  float det = a*c - b*b;
+  if (det <= 0.0) { gl_PointSize = 0.0; return; }
+  vConic = vec3(c, -b, a) / det;              // inverse 2D covariance
+
+  // Cover 3 standard deviations of the larger axis.
+  float mid = 0.5 * (a + c);
+  float l1 = mid + sqrt(max(0.1, mid*mid - det));
+  vRadius = ceil(3.0 * sqrt(l1));
+  gl_PointSize = min(vRadius * 2.0, 512.0);
+
+  vCol = aCol; vAlpha = aAlpha;
+}`;
+
+const SPLAT_FS = `#version 300 es
+precision highp float;
+in vec3 vCol; in float vAlpha; in vec3 vConic; in float vRadius;
+out vec4 outColor;
+void main() {
+  // gl_PointCoord has y growing downward; screen-space covariance has y
+  // growing upward, so the sign must be flipped or every ellipse is mirrored.
+  vec2 d = (gl_PointCoord - vec2(0.5)) * vRadius * 2.0;
+  d.y = -d.y;
+  float power = -0.5 * (vConic.x * d.x * d.x + vConic.z * d.y * d.y)
+                - vConic.y * d.x * d.y;
+  if (power > 0.0) discard;
+  float alpha = vAlpha * exp(power);
+  if (alpha < 0.004) discard;                 // below 1/255, invisible
+  outColor = vec4(vCol, alpha);
+}`;
+
+const pointProg = link(POINT_VS, POINT_FS);
+const splatProg = link(SPLAT_VS, SPLAT_FS);
+
+const uni = {
+  point: {
+    proj: gl.getUniformLocation(pointProg, 'uProj'),
+    view: gl.getUniformLocation(pointProg, 'uView'),
+    size: gl.getUniformLocation(pointProg, 'uSize'),
+  },
+  splat: {
+    proj: gl.getUniformLocation(splatProg, 'uProj'),
+    view: gl.getUniformLocation(splatProg, 'uView'),
+    focal: gl.getUniformLocation(splatProg, 'uFocal'),
+    viewport: gl.getUniformLocation(splatProg, 'uViewport'),
+  },
+};
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const buf = {
+  pos: gl.createBuffer(), col: gl.createBuffer(),
+  scale: gl.createBuffer(), quat: gl.createBuffer(), alpha: gl.createBuffer(),
+  index: gl.createBuffer(),
+};
+
+let cloud = null, center = [0, 0, 0], radius = 1;
+let isSplat = false, splatTotal = 0;
+
+function bindAttr(buffer, data, loc, size) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+}
+
+function upload(c) {
+  cloud = c;
+  gl.bindVertexArray(vao);
+  bindAttr(buf.pos, c.positions, 0, 3);
+  bindAttr(buf.col, c.colors || new Float32Array(c.count * 3).fill(0.85), 1, 3);
+
+  if (isSplat) {
+    bindAttr(buf.scale, c.scales, 2, 3);
+    bindAttr(buf.quat, c.quats, 3, 4);
+    bindAttr(buf.alpha, c.alphas, 4, 1);
+    // Drawn through an index buffer so a re-sort only rewrites indices
+    // rather than re-uploading every gaussian's attributes.
+    order = new Uint32Array(c.count);
+    for (let i = 0; i < c.count; i++) order[i] = i;
+    depth = new Float32Array(c.count);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf.index);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, order, gl.DYNAMIC_DRAW);
+    lastSortEye = null;
+  }
+
+  // Frame the scene from a robust bounding box.
+  const p = c.positions;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < c.count; i++)
+    for (let k = 0; k < 3; k++) {
+      const v = p[i * 3 + k];
+      if (v < lo[k]) lo[k] = v;
+      if (v > hi[k]) hi[k] = v;
+    }
+  center = [0, 1, 2].map(k => (lo[k] + hi[k]) / 2);
+  radius = Math.max(...[0, 1, 2].map(k => hi[k] - lo[k])) / 2 || 1;
+  cam.dist = radius * 2.6;
+}
+
+// --- depth sorting --------------------------------------------------------
+// Alpha compositing is order-dependent, so gaussians must be drawn
+// back-to-front. A comparison sort of 100k+ items every frame is too slow, so
+// this is a counting sort over quantised depth: O(n) with a fixed 64k-bucket
+// histogram, which is what makes a per-frame re-sort affordable at all.
+
+let order = null, depth = null, lastSortEye = null;
+const SORT_BUCKETS = 65536;
+const counts = new Uint32Array(SORT_BUCKETS);
+let sortsThisSecond = 0, lastSortMs = 0;
+
+// Pure so it can be tested directly rather than through a copy: given
+// positions and an eye, fill `order` back-to-front. No GL, no globals.
+// Reused across frames. Allocating the bucket array inside the sort cost a
+// 2 MB allocation and zero-fill *per frame* at a million gaussians, which is
+// pure waste in a function that runs whenever the camera moves.
+let bucketScratch = null;
+
+function splatScratch(n) {
+  if (!bucketScratch || bucketScratch.length < n) bucketScratch = new Uint16Array(n);
+  return bucketScratch;
+}
+
+function computeSplatOrder(positions, n, eye, order, depth, counts, bucket) {
+  bucket = bucket || splatScratch(n);
+  const ex = eye[0], ey = eye[1], ez = eye[2];
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0, p = 0; i < n; i++, p += 3) {
+    const dx = positions[p] - ex, dy = positions[p + 1] - ey, dz = positions[p + 2] - ez;
+    const d = dx * dx + dy * dy + dz * dz;     // squared distance is monotonic
+    depth[i] = d;
+    if (d < lo) lo = d;
+    if (d > hi) hi = d;
+  }
+  const span = hi - lo || 1;
+  const scale = (SORT_BUCKETS - 1) / span;
+
+  counts.fill(0);
+  for (let i = 0; i < n; i++) {
+    // Farthest first: bucket 0 is the most distant gaussian.
+    const b = ((hi - depth[i]) * scale) | 0;
+    bucket[i] = b;
+    counts[b]++;
+  }
+  let running = 0;
+  for (let b = 0; b < SORT_BUCKETS; b++) { const c = counts[b]; counts[b] = running; running += c; }
+  for (let i = 0; i < n; i++) order[counts[bucket[i]]++] = i;
+  return order;
+}
+
+function sortSplats(eye) {
+  if (!cloud || !isSplat) return;
+  computeSplatOrder(cloud.positions, cloud.count, eye, order, depth, counts);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf.index);
+  gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, order);
+  lastSortEye = eye.slice();
+  sortsThisSecond++;
+}
+
+function needsResort(eye) {
+  if (lastSortEye === null) return true;
+  // Re-sorting on every frame is wasted work when the camera barely moved;
+  // ordering only changes materially once the viewpoint shifts.
+  const d = Math.hypot(eye[0] - lastSortEye[0], eye[1] - lastSortEye[1], eye[2] - lastSortEye[2]);
+  return d > radius * 0.01;
+}
+
+// --- camera (mouse + touch) ----------------------------------------------
+const cam = { yaw: 0.6, pitch: -0.25, dist: 3 };
+let drag = null, pinch = null;
+
+function pointerDown(x, y) { drag = { x, y }; }
+function pointerMove(x, y) {
+  if (!drag) return;
+  cam.yaw += (x - drag.x) * 0.006;
+  cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + (y - drag.y) * 0.006));
+  drag = { x, y };
+}
+canvas.addEventListener('pointerdown', e => { canvas.setPointerCapture(e.pointerId); pointerDown(e.clientX, e.clientY); });
+canvas.addEventListener('pointermove', e => pointerMove(e.clientX, e.clientY));
+canvas.addEventListener('pointerup', () => { drag = null; });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  cam.dist = Math.max(radius * 0.05, Math.min(radius * 40, cam.dist * (1 + Math.sign(e.deltaY) * 0.12)));
+}, { passive: false });
+
+// Touch pinch, for the mobile WebView path.
+canvas.addEventListener('touchstart', e => {
+  if (e.touches.length === 2) {
+    pinch = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                       e.touches[0].clientY - e.touches[1].clientY);
+  }
+}, { passive: true });
+canvas.addEventListener('touchmove', e => {
+  if (e.touches.length === 2 && pinch) {
+    const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                         e.touches[0].clientY - e.touches[1].clientY);
+    cam.dist = Math.max(radius * 0.05, Math.min(radius * 40, cam.dist * (pinch / d)));
+    pinch = d;
+    e.preventDefault();
+  }
+}, { passive: false });
+canvas.addEventListener('touchend', () => { pinch = null; });
+
+// --- matrices -------------------------------------------------------------
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2);
+  return new Float32Array([
+    f / aspect, 0, 0, 0, 0, f, 0, 0,
+    0, 0, (far + near) / (near - far), -1,
+    0, 0, (2 * far * near) / (near - far), 0]);
+}
+function lookAt(eye, target, up) {
+  const z = norm(sub(eye, target)), x = norm(cross(up, z)), y = cross(z, x);
+  return new Float32Array([
+    x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0,
+    -dot(x, eye), -dot(y, eye), -dot(z, eye), 1]);
+}
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = v => { const l = Math.hypot(...v) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+
+// --- loop -----------------------------------------------------------------
+let frames = 0, fps = 0, lastFpsAt = performance.now();
+
+// Split from the frame loop so the draw can be invoked directly. Headless
+// browsers run no compositor, so requestAnimationFrame never fires at a real
+// rate and any fps figure measured there is meaningless — but timing N
+// synchronous draws with gl.finish() measures the actual GPU cost, which is
+// what "will this be interactive" really turns on.
+function drawFrame() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(0.043, 0.051, 0.063, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  if (cloud) {
+    const eye = [
+      center[0] + cam.dist * Math.cos(cam.pitch) * Math.sin(cam.yaw),
+      center[1] + cam.dist * Math.sin(cam.pitch),
+      center[2] + cam.dist * Math.cos(cam.pitch) * Math.cos(cam.yaw),
+    ];
+    const fovy = 1.05;
+    const proj = perspective(fovy, w / h, radius * 0.01, radius * 100);
+    const view = lookAt(eye, center, [0, -1, 0]);
+    gl.bindVertexArray(vao);
+
+    if (isSplat) {
+      if (needsResort(eye)) {
+        const t0 = performance.now();
+        sortSplats(eye);
+        lastSortMs = performance.now() - t0;
+      }
+      gl.useProgram(splatProg);
+      gl.uniformMatrix4fv(uni.splat.proj, false, proj);
+      gl.uniformMatrix4fv(uni.splat.view, false, view);
+      // Focal length in pixels, which is what the projection Jacobian needs.
+      const fy = h / (2 * Math.tan(fovy / 2));
+      gl.uniform2f(uni.splat.focal, fy, fy);
+      gl.uniform2f(uni.splat.viewport, w, h);
+
+      // Back-to-front src-over. Depth testing must be off: a nearer gaussian
+      // must not reject the farther ones already blended behind it.
+      gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.BLEND);
+      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf.index);
+      gl.drawElements(gl.POINTS, cloud.count, gl.UNSIGNED_INT, 0);
+    } else {
+      gl.useProgram(pointProg);
+      gl.uniformMatrix4fv(uni.point.proj, false, proj);
+      gl.uniformMatrix4fv(uni.point.view, false, view);
+      gl.uniform1f(uni.point.size, radius * 0.9 * dpr);
+      gl.enable(gl.DEPTH_TEST);
+      gl.disable(gl.BLEND);
+      gl.drawArrays(gl.POINTS, 0, cloud.count);
+    }
+  }
+
+}
+
+function render() {
+  drawFrame();
+  frames++;
+  const now = performance.now();
+  if (now - lastFpsAt > 500) {
+    fps = (frames * 1000) / (now - lastFpsAt);
+    frames = 0; lastFpsAt = now; sortsThisSecond = 0;
+    if (cloud) updateStats();
+  }
+  requestAnimationFrame(render);
+}
+
+// Milliseconds of GPU work per frame, averaged over `n` draws.
+//
+// The barrier is a 1x1 readPixels, not gl.finish(): under ANGLE/D3D11 finish()
+// returned immediately and the whole benchmark measured 0.00 ms, because it
+// timed how fast commands could be queued rather than executed. readPixels
+// cannot return until the pipeline has actually produced the pixel.
+function benchmarkFrame(n = 60) {
+  if (!cloud) return null;
+  const px = new Uint8Array(4);
+  const sync = () => gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+
+  drawFrame();
+  sync();                                   // warm: shaders, buffers, driver
+  const t0 = performance.now();
+  for (let i = 0; i < n; i++) {
+    // Nudge the camera so each frame re-sorts and re-rasterises; drawing the
+    // same view repeatedly lets the driver skip work a real user would pay for.
+    cam.yaw += 0.01;
+    drawFrame();
+  }
+  sync();
+  return (performance.now() - t0) / n;
+}
+
+function updateStats() {
+  // Below 10 fps the interesting question is *how* slow, and rounding a
+  // struggling 0.6 fps to "0" hides exactly the case worth reporting.
+  const rate = fps >= 10 ? Math.round(fps) : fps.toFixed(1);
+  statsEl.textContent =
+    `${cloud.count.toLocaleString()} points\n` +
+    `${rate} fps · WebGL2 · tier ${deviceTier()}\n` +
+    `${currentLod === null ? 'local file' : 'LOD ' + currentLod}` +
+    (isSplat ? `
+${splatTotal.toLocaleString()} gaussians in file` +
+               `
+sort ${lastSortMs < 0.1 ? '<0.1' : lastSortMs.toFixed(1)} ms` : '');
+}
+requestAnimationFrame(render);
+
+// --- AR handoff (MPO-248) -------------------------------------------------
+//
+// Option A from the issue: hand the exported asset to the OS viewer rather
+// than rendering AR ourselves. iOS Safari intercepts <a rel="ar"> pointing at
+// a USDZ and opens AR Quick Look; Android Chrome follows an intent:// URL into
+// Scene Viewer. Both give real plane detection and placement for free.
+//
+// No splats down this path — neither OS viewer accepts them — so it needs the
+// mesh export. That is exactly why the mesh stage is not optional for AR.
+
+function arCapability(ua = navigator.userAgent, platform = navigator.platform || "") {
+  // iPadOS reports itself as a Mac; the touch-point count is what separates a
+  // real iPad from a desktop Safari that cannot do Quick Look.
+  const iOS = /iPad|iPhone|iPod/.test(ua) ||
+              (platform === "MacIntel" && (navigator.maxTouchPoints || 0) > 1);
+  if (iOS) return "quicklook";
+  if (/Android/.test(ua)) return "scene-viewer";
+  return null;
+}
+
+// Scene Viewer runs in another app and fetches the file itself, so the URL has
+// to be absolute and reachable from outside this page.
+function sceneViewerURL(fileURL, { title = "ClipTo3D", fallback = "" } = {}) {
+  const params = new URLSearchParams({
+    file: fileURL,
+    mode: "ar_preferred",
+    title,
+  });
+  const parts = [
+    `intent://arvr.google.com/scene-viewer/1.0?${params}`,
+    "#Intent",
+    "scheme=https",
+    "package=com.google.android.googlequicksearchbox",
+    "action=android.intent.action.VIEW",
+  ];
+  if (fallback) parts.push(`S.browser_fallback_url=${encodeURIComponent(fallback)}`);
+  parts.push("end;");
+  return parts.join(";");
+}
+
+const AR_ASSETS = { quicklook: /\.usdz$/i, "scene-viewer": /\.glb$/i };
+
+function pickArAsset(artifacts, capability) {
+  const want = AR_ASSETS[capability];
+  if (!want) return null;
+  const named = (artifacts || []).filter(a => want.test(a.name));
+  // A mesh, not a point cloud: neither OS viewer lights or occludes points,
+  // so a cloud handed to Scene Viewer reads as noise.
+  return named.find(a => /mesh|scene/i.test(a.name)) || named[0] || null;
+}
+
+// Scene Viewer cannot reach a private address, so say so rather than opening
+// a viewer that will fail with an unhelpful error.
+function isPubliclyReachable(url) {
+  try {
+    const host = new URL(url, location.href).hostname;
+    return !(host === "localhost" || host === "::1" || /\.local$/i.test(host) ||
+             /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+             /^172\.(1[6-9]|2\d|3[01])\./.test(host));
+  } catch { return false; }
+}
+
+const arEl = document.getElementById('ar');
+
+function showArHandoff(artifacts) {
+  const cap = arCapability();
+  arEl.hidden = true;
+  arEl.innerHTML = '';
+  if (!cap) return;
+
+  const asset = pickArAsset(artifacts, cap);
+  if (!asset) {
+    arEl.hidden = false;
+    arEl.textContent = cap === 'quicklook'
+      ? 'AR needs scene.usdz — re-run with the mesh and ar extras'
+      : 'AR needs mesh.glb — re-run with the mesh extra';
+    return;
+  }
+
+  const absolute = new URL(asset.url, location.href).href;
+  arEl.hidden = false;
+  // Only Scene Viewer needs this: it runs in another app and fetches the file
+  // itself. Quick Look is fetched by Safari in this same context, so a local
+  // address is fine there and gating it would break development on iOS.
+  if (cap === 'scene-viewer' && !isPubliclyReachable(absolute)) {
+    arEl.textContent = 'Scene Viewer needs a publicly reachable URL; this asset is local';
+    return;
+  }
+
+  const a = document.createElement('a');
+  if (cap === 'quicklook') {
+    a.rel = 'ar';
+    a.href = absolute;
+    // Quick Look only intercepts the link when it wraps an <img>. Without a
+    // child image Safari downloads the file instead of opening AR.
+    const img = document.createElement('img');
+    img.alt = '';
+    img.width = 1; img.height = 1;
+    img.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+    a.appendChild(img);
+    a.append('view in AR');
+  } else {
+    a.href = sceneViewerURL(absolute, { fallback: location.href });
+    a.textContent = 'view in AR';
+  }
+  arEl.appendChild(a);
+}
+
+// --- job service ----------------------------------------------------------
+//
+// Drop in a video, watch stage-level progress, then view the result. The
+// pure pieces (poll loop, artifact choice, progress summary) are split out
+// from the DOM so they can be tested without a browser.
+
+const STAGE_ORDER = ['frames', 'keyframe', 'depth', 'colmap', 'dataset',
+                     'fuse', 'mesh', 'splat', 'export'];
+const TERMINAL = new Set(['done', 'failed', 'cancelled']);
+
+function summarise(job) {
+  const stages = job.stages || {};
+  const names = STAGE_ORDER.filter(n => n in stages)
+    .concat(Object.keys(stages).filter(n => !STAGE_ORDER.includes(n)));
+  const done = names.filter(n => stages[n].status === 'done').length;
+  return {
+    names,
+    done,
+    // Against the stages the pipeline actually declared, not a guessed total:
+    // an over-optimistic bar that stalls at 90% is worse than a shorter one.
+    fraction: names.length ? done / names.length : 0,
+    running: names.find(n => stages[n].status === 'running') || null,
+    finished: TERMINAL.has(job.status),
+    failed: job.status === 'failed',
+    error: job.error || Object.values(stages).map(s => s.error).find(Boolean) || '',
+  };
+}
+
+// What to show once a job finishes, best first: splats look better than a
+// mesh, a mesh better than a bare cloud, and any LOD beats nothing.
+const VIEWABLE = [/^scene\.splat$/, /^mesh\.glb$/, /^cloud\.glb$/, /^cloud_lod\d\.glb$/];
+
+function pickArtifact(artifacts) {
+  for (const pattern of VIEWABLE) {
+    const hit = (artifacts || []).find(a => pattern.test(a.name));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// Backoff so a long job does not hammer the API: quick while stages are
+// turning over, slower as it settles.
+function pollDelay(elapsedMs) {
+  return Math.min(5000, 500 + elapsedMs / 20);
+}
+
+async function pollJob(api, id, onUpdate, { sleep = ms => new Promise(r => setTimeout(r, ms)),
+                                            now = () => performance.now(),
+                                            maxMs = 6 * 3600 * 1000 } = {}) {
+  const t0 = now();
+  for (;;) {
+    const job = await api(`/jobs/${id}`);
+    const s = summarise(job);
+    onUpdate(job, s);
+    if (s.finished) return job;
+    if (now() - t0 > maxMs) throw new Error('job did not finish in time');
+    await sleep(pollDelay(now() - t0));
+  }
+}
+
+const keyEl = document.getElementById('key');
+const qualityEl = document.getElementById('quality');
+const videoEl = document.getElementById('video');
+const goEl = document.getElementById('go');
+const stopEl = document.getElementById('stop');
+const stagesEl = document.getElementById('stages');
+const barEl = document.getElementById('bar');
+
+// Kept out of the URL: a key in the query string lands in history and logs.
+keyEl.value = localStorage.getItem('clipto3d.key') || '';
+keyEl.onchange = () => localStorage.setItem('clipto3d.key', keyEl.value);
+
+async function api(path, init = {}) {
+  const res = await fetch(path, {
+    ...init,
+    headers: { 'X-API-Key': keyEl.value, ...(init.headers || {}) },
+  });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.detail || `${res.status} ${res.statusText}`);
+  }
+  return res.headers.get('content-type')?.includes('json') ? res.json() : res;
+}
+
+function renderStages(job, s) {
+  stagesEl.innerHTML = '';
+  for (const name of s.names) {
+    const st = job.stages[name];
+    const row = document.createElement('div');
+    row.className = 'stage';
+    row.dataset.status = st.status;
+    const b = document.createElement('b'); b.textContent = name;
+    const i = document.createElement('i');
+    i.textContent = st.seconds != null ? `${st.seconds.toFixed(1)}s`
+                  : st.status === 'running' ? '…' : '';
+    row.append(b, i);
+    stagesEl.appendChild(row);
+  }
+  barEl.hidden = false;
+  barEl.firstElementChild.style.width = `${(s.fraction * 100).toFixed(1)}%`;
+}
+
+let activeJob = null;
+
+goEl.onclick = async () => {
+  const file = videoEl.files[0];
+  if (!file) { errEl.textContent = 'choose a video first'; return; }
+  errEl.textContent = '';
+  goEl.disabled = true;
+  try {
+    const body = new FormData();
+    body.append('video', file);
+    const created = await api(`/jobs?quality=${encodeURIComponent(qualityEl.value)}`,
+                              { method: 'POST', body });
+    activeJob = created.id;
+    stopEl.hidden = false;
+    statsEl.textContent = `job ${created.id} queued`;
+
+    const job = await pollJob(api, created.id, (j, s) => {
+      renderStages(j, s);
+      statsEl.textContent = s.running ? `${s.running}… (${s.done}/${s.names.length})`
+                                      : `job ${j.status}`;
+    });
+
+    if (job.status !== 'done') throw new Error(summarise(job).error || `job ${job.status}`);
+    const { artifacts } = await api(`/jobs/${created.id}/artifacts`);
+    showArHandoff(artifacts);
+    const pick = pickArtifact(artifacts);
+    if (!pick) throw new Error('job finished but produced nothing viewable');
+    await loadURL(pick.url, null, pick.name);
+  } catch (e) {
+    errEl.textContent = e.message;
+  } finally {
+    goEl.disabled = false;
+    stopEl.hidden = true;
+    activeJob = null;
+  }
+};
+
+stopEl.onclick = async () => {
+  if (activeJob) await api(`/jobs/${activeJob}/cancel`, { method: 'POST' })
+    .catch(e => errEl.textContent = e.message);
+};
+
+// --- loading --------------------------------------------------------------
+let currentLod = null;
+
+async function loadURL(url, lod, name = url) {
+  errEl.textContent = '';
+  statsEl.textContent = `loading ${name}…`;
+  // Relative URLs are this service's own artifact route and need the key;
+  // an absolute one is a presigned URL that already carries its credentials
+  // and would reject the extra header on a CORS preflight.
+  const res = await fetch(url, /^[a-z]+:\/\//i.test(url)
+    ? {} : { headers: { 'X-API-Key': keyEl.value } });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const buf = await res.arrayBuffer();
+
+  if (name.endsWith('.splat')) {
+    const s = loadSplat(buf, splatBudget());
+    isSplat = true;
+    upload({ positions: s.positions, colors: s.colors, count: s.count,
+             scales: s.scales, alphas: s.alphas });
+    splatTotal = s.total;
+  } else {
+    isSplat = false;
+    splatTotal = 0;
+    upload(loadPointCloud(buf));
+  }
+  currentLod = lod;
+  updateStats();
+}
+
+// The file is ordered by visual importance, so truncating it *is* the LOD.
+function splatBudget() {
+  return [2_000_000, 800_000, 250_000][deviceTier()] ?? 250_000;
+}
+
+// Progressive: show the coarsest level immediately, then refine upward, so
+// first paint is not gated on the full asset.
+async function loadProgressive(base = '.') {
+  const candidates = [
+    { url: `${base}/cloud_lod2.glb`, lod: 2 },
+    { url: `${base}/cloud_lod1.glb`, lod: 1 },
+    { url: `${base}/cloud.glb`, lod: 0 },
+  ].filter(c => c.lod >= deviceTier());
+
+  let loadedAny = false;
+  for (const c of candidates) {
+    try {
+      await loadURL(c.url, c.lod);
+      loadedAny = true;
+    } catch (e) {
+      if (!loadedAny) errEl.textContent = `could not load ${c.url}: ${e.message}`;
+    }
+  }
+  if (!loadedAny) statsEl.textContent = 'drop a .glb export here';
+  buildLodButtons(base, candidates);
+
+  // The AR assets sit beside the LODs when a job directory is served flat, so
+  // offer them without needing the job API.
+  showArHandoff([
+    { name: 'scene.usdz', url: `${base}/scene.usdz` },
+    { name: 'mesh.glb', url: `${base}/mesh.glb` },
+  ]);
+}
+
+function buildLodButtons(base, candidates) {
+  lodsEl.innerHTML = '';
+  for (const c of candidates) {
+    const b = document.createElement('button');
+    b.textContent = c.lod === 0 ? 'full' : `LOD ${c.lod}`;
+    b.setAttribute('aria-pressed', String(c.lod === currentLod));
+    b.onclick = async () => {
+      await loadURL(c.url, c.lod).catch(e => errEl.textContent = e.message);
+      for (const other of lodsEl.children) other.setAttribute('aria-pressed', 'false');
+      b.setAttribute('aria-pressed', 'true');
+    };
+    lodsEl.appendChild(b);
+  }
+}
+
+// Drag and drop, so a viewer opened from the filesystem is still useful.
+addEventListener('dragover', e => { e.preventDefault(); dropEl.classList.add('on'); });
+addEventListener('dragleave', () => dropEl.classList.remove('on'));
+addEventListener('drop', async e => {
+  e.preventDefault();
+  dropEl.classList.remove('on');
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  try {
+    const buf = await file.arrayBuffer();
+    if (file.name.endsWith('.splat')) {
+      const s = loadSplat(buf, splatBudget());
+      isSplat = true; splatTotal = s.total;
+      upload({ positions: s.positions, colors: s.colors, count: s.count,
+               scales: s.scales, alphas: s.alphas });
+    } else {
+      isSplat = false; splatTotal = 0;
+      upload(loadPointCloud(buf));
+    }
+    currentLod = null;
+    updateStats();
+  } catch (err) { errEl.textContent = err.message; }
+});
+
+const params = new URLSearchParams(location.search);
+// ?src=… opens one asset directly, which is what a shareable link to a
+// finished result needs; ?job=… is the progressive multi-LOD path.
+if (params.get('src')) {
+  const src = params.get('src');
+  loadURL(src, null, params.get('name') || src)
+    .catch(e => errEl.textContent = `could not load ${src}: ${e.message}`);
+} else {
+  loadProgressive(params.get('job') || '.');
+}
+
+// Exposed so an automated check can assert the scene really rendered rather
+// than inferring it from the absence of an error.
+window.__viewer = {
+  get pointCount() { return cloud ? cloud.count : 0; },
+  get isSplat() { return isSplat; },
+  get sortMs() { return lastSortMs; },
+  get order() { return order; },
+  sortSplats,
+  get splatTotal() { return splatTotal; },
+  loadSplat,
+  get fps() { return fps; },
+  get lod() { return currentLod; },
+  loadProgressive,
+  benchmarkFrame,
+  summarise,
+  pickArtifact,
+  pollJob,
+  pollDelay,
+  arCapability,
+  sceneViewerURL,
+  pickArAsset,
+  isPubliclyReachable,
+};
+</script>

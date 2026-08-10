@@ -1,0 +1,289 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Never reach for the network mid-test: checkpoints must come from the cache
+  # restored below, and a missing one should fail loudly rather than download
+  # 1.3GB on every run (MPO-233).
+  CLIPTO3D_OFFLINE: "1"
+  CLIPTO3D_CHECKPOINT_DIR: ${{ github.workspace }}/.checkpoints
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject, and the current release.
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # --extra cpu, not cuda: CI has no GPU, and the cpu wheels are a fraction
+      # of the download. The CUDA path is exercised by the worker image build.
+      - name: Sync
+        run: >
+          uv sync --frozen --group dev --python ${{ matrix.python }}
+          --extra cpu --extra service --extra mesh --extra ar
+
+      - name: Lockfile is up to date
+        run: uv lock --check
+
+      - name: Tests
+        run: uv run --no-sync pytest -q
+
+  base-install-is-lean:
+    # Guards the two properties that quietly regress: the base install stays
+    # torch-free and GL-free (MPO-231, MPO-234), and the torch-only modules
+    # still degrade gracefully rather than exploding on import.
+    name: base install stays lean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync base only
+        run: uv sync --frozen --group dev
+
+      - name: No torch, no CUDA, no GL in the base environment
+        run: |
+          uv run --no-sync python - <<'PY'
+          import importlib.util as u
+          banned = ["torch", "torchvision", "matplotlib", "pyglet", "OpenGL", "trimesh",
+                    "skimage", "pxr", "fastapi", "boto3"]
+          present = [m for m in banned if u.find_spec(m) is not None]
+          assert not present, f"base install pulled in {present}"
+          print("base install is clean:", banned)
+          PY
+
+      - name: Torch-free half of the pipeline still imports
+        run: |
+          uv run --no-sync python - <<'PY'
+          import importlib
+          for m in ["pipeline", "job_paths", "frames", "audio", "colmap_io",
+                    "pointcloud_io", "depth_io", "depth_scale", "checkpoints",
+                    "keyframes", "convert_colmap_to_gs", "fusion.fuse",
+                    "structure_from_motion.sfm", "storage", "export",
+                    # The worker is a base module: a worker container has
+                    # CUDA and COLMAP but no reason to carry a web framework,
+                    # so this must not drag FastAPI in.
+                    "job_registry", "worker"]:
+              importlib.import_module(m)
+          print("all base modules import without torch")
+          PY
+
+      - name: Suite still collects without torch
+        run: uv run --no-sync pytest -q
+
+  service-image:
+    # Cheap enough to run on PRs, unlike the worker image: no CUDA, no COLMAP
+    # source build. It is also the deployable artifact, so a break here is a
+    # break in the thing that actually gets hosted.
+    name: service image builds and serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.service
+          push: false
+          load: true
+          tags: clipto3d-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: It starts, serves, and refuses an unknown key
+        run: |
+          set -euo pipefail
+          docker run -d --name api -p 8000:8000 \
+            -e CLIPTO3D_BOOTSTRAP_KEY=ci-bootstrap \
+            clipto3d-api:ci
+          for i in $(seq 30); do
+            curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          test "$(curl -fsS http://127.0.0.1:8000/health | jq -r .auth)" = strict
+
+          # The land grab, from outside: an unknown key gets nothing, and the
+          # first key needs the bootstrap secret.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/jobs \
+                   -H 'X-API-Key: i-got-here-first')
+          test "$code" = 401 || { echo "FAIL: unknown key accepted ($code)"; exit 1; }
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:8000/keys)
+          test "$code" = 401 || { echo "FAIL: minted a key with no secret ($code)"; exit 1; }
+
+          key=$(curl -fsS -XPOST 'http://127.0.0.1:8000/keys?label=ci' \
+                  -H 'X-Bootstrap-Key: ci-bootstrap' | jq -r .api_key)
+          test -n "$key" && test "$key" != null
+
+          curl -fsS http://127.0.0.1:8000/jobs -H "X-API-Key: $key" | jq -e '.jobs == []'
+          # The viewer is served from the API's own origin, with the headers on.
+          curl -fsS -D- -o /dev/null http://127.0.0.1:8000/viewer \
+            | grep -qi 'x-content-type-options: nosniff'
+
+      - name: A forged X-Forwarded-For cannot buy a fresh rate-limit bucket
+        # The image once ran uvicorn with `--forwarded-allow-ips '*'`, which
+        # made ProxyHeadersMiddleware rewrite the peer address from a header
+        # any caller can set. client_identity() falls back to that address, so
+        # a new forged value per request was a new bucket — the rate limiter
+        # and the public-mode signup cap both stopped limiting anything.
+        # Unit tests cannot see this: the bug lives entirely in the CMD.
+        run: |
+          set -euo pipefail
+          docker rm -f api >/dev/null 2>&1 || true
+          docker run -d --name api -p 8000:8000 \
+            -e CLIPTO3D_BOOTSTRAP_KEY=ci-bootstrap \
+            -e CLIPTO3D_RATE_LIMIT=5 \
+            clipto3d-api:ci
+          for i in $(seq 30); do
+            curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # No API key: client_identity() then buckets on the address, which
+          # is the path under test. 12 requests against a limit of 5.
+          seen429=0
+          for i in $(seq 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/jobs \
+                     -H "X-Forwarded-For: 10.0.0.$i")
+            [ "$code" = 429 ] && seen429=1
+          done
+          test "$seen429" = 1 || {
+            echo "FAIL: 12 requests over a limit of 5 never hit 429 —"
+            echo "      X-Forwarded-For is being trusted with CLIPTO3D_TRUST_PROXY unset"
+            exit 1
+          }
+          docker rm -f api >/dev/null
+
+      - name: With a proxy declared, X-Forwarded-For is honoured again
+        # The converse, so the fix above cannot be "ignore the header always":
+        # a deployment behind Caddy needs per-client buckets, not one bucket
+        # for the proxy.
+        run: |
+          set -euo pipefail
+          docker run -d --name api-proxy -p 8001:8000 \
+            -e CLIPTO3D_BOOTSTRAP_KEY=ci-bootstrap \
+            -e CLIPTO3D_RATE_LIMIT=5 \
+            -e CLIPTO3D_TRUST_PROXY=1 \
+            clipto3d-api:ci
+          for i in $(seq 30); do
+            curl -fsS http://127.0.0.1:8001/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          for i in $(seq 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8001/jobs \
+                     -H "X-Forwarded-For: 10.0.0.$i")
+            test "$code" != 429 || {
+              echo "FAIL: distinct forwarded clients shared one bucket ($code)"; exit 1
+            }
+          done
+          # And the same client still gets limited.
+          seen429=0
+          for i in $(seq 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8001/jobs \
+                     -H "X-Forwarded-For: 10.9.9.9")
+            [ "$code" = 429 ] && seen429=1
+          done
+          test "$seen429" = 1 || { echo "FAIL: one client was never limited"; exit 1; }
+          docker rm -f api-proxy >/dev/null
+
+      - name: It does not run as root, and carries no torch
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --entrypoint id clipto3d-api:ci -un)" = clipto3d
+          docker run --rm --entrypoint python clipto3d-api:ci -c '
+          import importlib.util as u
+          banned = [m for m in ("torch", "torchvision", "OpenGL", "trimesh")
+                    if u.find_spec(m) is not None]
+          assert not banned, f"the API image pulled in {banned}"
+          import service; assert service.app is not None
+          print("api image is lean")'
+
+      - name: Logs on failure
+        if: failure()
+        run: docker logs api || true
+
+  worker-image:
+    # The image is where a genuinely clean install happens, and it is the only
+    # place COLMAP/ffmpeg integration gets exercised. It caught four real bugs
+    # that unit tests could not (MPO-232), so it is worth the build time.
+    name: worker image builds
+    runs-on: ubuntu-latest
+    # Not on PRs by default: a cold COLMAP build is slow.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: clipto3d-worker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_JOBS=4
+            TORCH_CUDA_ARCH_LIST=8.6
+            BAKE_CHECKPOINTS=depth-anything-v2-vits
+
+      - name: Pipeline runs end to end in the image
+        run: |
+          docker run --rm -v "${{ github.workspace }}/ci-out:/work" \
+            --entrypoint sh clipto3d-worker:ci -euc '
+              set -eu
+              python - <<'"'"'PY'"'"'
+          import sys; sys.path[:0] = ["/app", "/app/tests"]
+          from synthetic_scene import build_scene
+          build_scene("/work/frames", n_views=16, width=480, height=360)
+          print("rendered 16 synthetic views")
+          PY
+              ffmpeg -loglevel error -framerate 8 -i /work/frames/frame_%06d.jpg \
+                  -c:v libx264 -pix_fmt yuv420p /work/clip.mp4
+              cd /app && python pipeline.py /work/clip.mp4 --job /work/job \
+                  --fps 8 --depth-encoder vits --no-colmap-gpu
+              test -s /work/job/cloud/fused_cloud.ply
+              test -s /work/job/dataset/transforms.json
+              # The mesh and the AR formats it unblocks (MPO-235/248). The
+              # image once shipped without scikit-image, so the mesh stage was
+              # skipped and no USDZ was produced — while the job still passed.
+              test -s /work/job/cloud/mesh.npz
+              test -s /work/job/export/mesh.glb
+              test -s /work/job/export/scene.usdz
+              # The runtime stage ships without a CUDA toolchain; assert it
+              # stayed that way, and that the kernels it replaced are present.
+              if command -v nvcc >/dev/null 2>&1; then
+                  echo "FAIL: nvcc is present in the runtime image"; exit 1
+              fi
+              test -s /opt/torch_extensions/gsplat_cuda/gsplat_cuda.so
+              echo "end-to-end OK"
+            '
